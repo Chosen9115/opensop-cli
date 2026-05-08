@@ -95,6 +95,17 @@ opensop submit <instance-id> collect-context \
   --confidence 0.92
 ```
 
+Before you commit to a run, preview what would happen without executing anything:
+
+```bash
+opensop dry-run lead-qualification \
+  --input lead_name="Ana García" \
+  --input lead_email=ana@example.com \
+  --input source=website
+```
+
+This validates your inputs against the process schema and describes each step — no instance is created. Exit code 1 if validation fails.
+
 Cancel a running instance:
 
 ```bash
@@ -231,20 +242,79 @@ Override per-call via env vars:
 OPENSOP_URL=https://prod.opensop.ai opensop list
 ```
 
+Use `--local` to target `http://localhost:3000` for a single call without changing your config:
+
+```bash
+opensop list --local                        # hit your dev server
+opensop run lead-qualification --local ...  # test locally before prod
+```
+
+## Process authoring
+
+The CLI supports the full authoring loop for `.sop.yaml` files — from lint to registration.
+
+**Step 1: lint your file**
+
+`schema validate` is fully client-side (no server round-trip). It checks structural requirements using `yq` (mikefarah/yq v4+) if installed, or `python3` + PyYAML as a fallback:
+
+```bash
+opensop schema validate ./my-process.sop.yaml
+```
+
+What it checks:
+
+- Top-level `opensop` version field present
+- `process` object with `name`, `version`, `description`, `inputs` (array), `steps` (array)
+- Each step has `id` and `type`; `type` is one of the known values (`form`, `automated`, `judgment`, `approval`, `webhook`, `notification`, `subprocess`, `loop`, `llm`, `wait`)
+- Each input has `name` and `type`
+- All `from:` reference strings match `steps.X.outputs.Y` or `process.inputs.Y`
+
+Exit 0 if valid, 1 if errors. Use `--json` to get a structured `{file, valid, errors}` object.
+
+**Step 2: preview execution**
+
+Run `dry-run` to validate inputs against the process schema and walk through each step's description without creating an instance:
+
+```bash
+opensop dry-run my-process --input foo=bar
+```
+
+Exit 0 if inputs are valid, 1 if validation fails.
+
+**Step 3: register**
+
+```bash
+opensop register ./my-process.sop.yaml
+```
+
+POSTs the file to `/sop/processes/register`. On success, prints `registered <name>@<version>`. If the server returns 401/403, registration may be admin-only — check your token scope or use the dashboard at `<OPENSOP_URL>/admin`.
+
 ## Subcommand reference
 
 | Command | Purpose |
 |---|---|
+| **Discovery** | |
 | `opensop list [--tag <tag>]` | List all registered processes, optionally filtered by tag |
 | `opensop search <keyword> [...]` | Ranked text search over process names, descriptions, and tags |
 | `opensop suggest "<task description>"` | Describe a task in prose; get the top-matching process back |
 | `opensop schema <name>` | Full process definition (`GET /sop/<name>/schema`) |
-| `opensop run <name> [opts]` | Start an instance (`POST /sop/<name>/start`) |
+| **Inspection** | |
 | `opensop status <id>` | Instance state (`GET /sop/<name>/<id>`) |
 | `opensop steps <id>` | All steps of an instance (`GET /sop/<name>/<id>/steps`) |
+| `opensop diff <id1> <id2>` | Compare two instances of the same process |
+| `opensop history --process <name> [--limit N]` | Recent instances of a specific process, newest-first |
+| `opensop compass` | Top processes by run-count, recency, and failure rate |
+| **Execution** | |
+| `opensop run <name> [opts]` | Start an instance (`POST /sop/<name>/start`) |
+| `opensop dry-run <name> [opts]` | Validate inputs + preview steps, no server execution |
 | `opensop submit <id> <step-id> [opts]` | Advance a paused step (`POST /sop/<name>/<id>/steps/<step-id>/submit`) |
 | `opensop cancel <id> [--reason TEXT]` | Cancel an instance (`POST /sop/<name>/<id>/cancel`) |
+| **Authoring** | |
+| `opensop register <process.yaml>` | POST a `.sop.yaml` to `/sop/processes/register` |
+| `opensop schema validate <file.yaml>` | Client-side YAML lint — no server round-trip |
+| **Admin** | |
 | `opensop instances [--state X] [--process Y]` | Paginated list (`GET /sop/instances`) |
+| **Config** | |
 | `opensop config [set <key> <value>]` | Manage config |
 | `opensop help` | Full help |
 
@@ -272,7 +342,7 @@ For discovery, agents should use `opensop search` or `opensop suggest` rather th
 ## Limitations
 
 - **Bash 4+** assumed. Default macOS bash is 3.2 — install a newer one (`brew install bash`) or run via `/usr/local/bin/bash`.
-- **No `register` subcommand.** Process registration in v0.2 of the OpenSOP server is admin-only; register via the dashboard or the Rails admin API.
+- **`register` may be admin-only.** Some OpenSOP deployments restrict `/sop/processes/register` to admin tokens. If you get a 401/403, check your token scope or use the dashboard.
 - **No webhooks.** The CLI doesn't run a server, so it can't receive webhook callbacks. The OpenSOP runtime handles those itself at `/sop/webhooks/<callback_id>`.
 - **Stubbed step types** in OpenSOP v0.2 (`judgment`, `approval`, `subprocess`, `wait`) pause but don't auto-advance — you'll need to `submit` them manually. See the [server's API docs](https://github.com/Chosen9115/opensop/blob/main/docs/API.md#whats-stubbed-v02) for the current state.
 

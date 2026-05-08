@@ -16,7 +16,7 @@ set -euo pipefail
 # Constants & paths
 # --------------------------------------------------------------------------- #
 
-readonly OPENSOP_CLI_VERSION="0.2.0"
+readonly OPENSOP_CLI_VERSION="0.3.0"
 readonly OPENSOP_HOME="${OPENSOP_HOME:-$HOME/.opensop}"
 readonly CONFIG_FILE="$OPENSOP_HOME/config"
 readonly CACHE_FILE="$OPENSOP_HOME/instances.tsv"
@@ -218,12 +218,22 @@ ${C_BOLD}DISCOVERY${C_RESET}
   suggest "<task description>"  inverse retrieval — describe a task, get a process recommendation
   schema <name>                 show the full definition of a process
 
-${C_BOLD}EXECUTION${C_RESET}
-  run <name> [opts]             start a new instance of a process
+${C_BOLD}INSPECTION${C_RESET}
   status <id>                   show the current state of an instance
   steps <id>                    show all steps of an instance
+  diff <id1> <id2>              compare two instances of the same process
+  history --process <name> [--limit N]  recent instances of a specific process (newest-first)
+  compass                       top processes by run-count, recency, and failure rate
+
+${C_BOLD}EXECUTION${C_RESET}
+  run <name> [opts]             start a new instance of a process
+  dry-run <name> [opts]         preview what would happen — validates inputs, no execution
   submit <id> <step-id> [opts]  submit outputs to advance a paused step
   cancel <id> [--reason TEXT]   cancel a running instance
+
+${C_BOLD}AUTHORING${C_RESET}
+  register <process.yaml>       POST a .sop.yaml to /sop/processes/register
+  schema validate <file.yaml>   client-side YAML lint (no server round-trip)
 
 ${C_BOLD}ADMIN${C_RESET}
   instances [--state X] [--process Y]   list instances (paginated)
@@ -236,10 +246,11 @@ ${C_BOLD}CONFIG${C_RESET}
 ${C_BOLD}GLOBAL OPTIONS${C_RESET}
   --json                        emit JSON to stdout (default when piped)
   --pretty                      pretty-print (default in TTY)
+  --local                       override OPENSOP_URL to http://localhost:3000 for this call
   --help, -h                    show this help
   --version, -v                 print version
 
-${C_BOLD}INPUT FORMS (for run/submit)${C_RESET}
+${C_BOLD}INPUT FORMS (for run/dry-run/submit)${C_RESET}
   --inputs '<json>'             pass inputs as a JSON object
   --inputs-file <path>          read inputs from a JSON file
   --input KEY=VALUE             repeatable; build the inputs object piece by piece
@@ -254,8 +265,15 @@ ${C_BOLD}EXAMPLES${C_RESET}
     --input lead_name="Ana García" \\
     --input lead_email=ana@example.com \\
     --input source=website
+  opensop dry-run lead-qualification --input lead_name=X --input lead_email=x@y.com --input source=website
   opensop status <instance-id>
   opensop steps <instance-id>
+  opensop diff <id1> <id2>
+  opensop history --process lead-qualification --limit 5
+  opensop compass
+  opensop schema validate ./my-process.sop.yaml
+  opensop register ./my-process.sop.yaml
+  opensop run lead-qualification --local --input lead_name=test  # targets localhost:3000
 
 ${C_BOLD}ENVIRONMENT${C_RESET}
   OPENSOP_URL                   override config server URL for one call
@@ -762,6 +780,494 @@ cmd_suggest() {
 }
 
 # --------------------------------------------------------------------------- #
+# Subcommand: diff — compare two instances of the same process
+# --------------------------------------------------------------------------- #
+
+cmd_diff() {
+  [[ $# -lt 2 ]] && die "usage: opensop diff <id1> <id2>"
+  local id1="$1" id2="$2"
+
+  local name1; name1=$(lookup_name "$id1")
+  local name2; name2=$(lookup_name "$id2")
+  [[ "$name1" != "$name2" ]] && die "instances are from different processes ($name1 vs $name2); diff requires the same process"
+
+  local a; a=$(api_get "/sop/$name1/$id1")
+  local b; b=$(api_get "/sop/$name2/$id2")
+
+  # Build structured diff in jq.
+  local diff_json
+  diff_json=$(jq -nc \
+    --argjson a "$a" \
+    --argjson b "$b" \
+    --arg id1 "$id1" \
+    --arg id2 "$id2" '
+    def maybe_diff(p; va; vb):
+      if va != vb then [{path: p, a: va, b: vb}] else [] end;
+
+    # Top-level fields.
+    (maybe_diff("state";    $a.state;   $b.state)) +
+    (maybe_diff("outputs";  $a.outputs; $b.outputs)) +
+    (maybe_diff("metadata"; $a.metadata; $b.metadata)) +
+
+    # Per-step diffs — iterate step IDs, accumulate diffs per-step.
+    ([$a.steps[]?.step_id, $b.steps[]?.step_id] | unique |
+      map(. as $sid |
+        ($a.steps[]? | select(.step_id == $sid)) as $sa |
+        ($b.steps[]? | select(.step_id == $sid)) as $sb |
+        maybe_diff("steps.\($sid).state";       $sa.state;       $sb.state) +
+        maybe_diff("steps.\($sid).sub_state";   $sa.sub_state;   $sb.sub_state) +
+        maybe_diff("steps.\($sid).outputs";     $sa.outputs;     $sb.outputs) +
+        maybe_diff("steps.\($sid).decided_by";  $sa.decided_by;  $sb.decided_by) +
+        maybe_diff("steps.\($sid).confidence";  $sa.confidence;  $sb.confidence) +
+        maybe_diff("steps.\($sid).duration_ms"; $sa.duration_ms; $sb.duration_ms)
+      ) | add // []) |
+
+    {
+      a: {id: $id1, state: $a.state, started_at: $a.started_at},
+      b: {id: $id2, state: $b.state, started_at: $b.started_at},
+      differences: .,
+      identical: (length == 0)
+    }
+  ')
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local identical; identical=$(echo "$diff_json" | jq -r '.identical')
+    if [[ "$identical" == "true" ]]; then
+      ok "instances are identical"
+      return 0
+    fi
+    printf '%sdiff%s  %s  vs  %s\n\n' "$C_BOLD" "$C_RESET" "$id1" "$id2"
+    echo "$diff_json" | jq -r '.differences[] | "\(.path)\t\(.a // "null")\t\(.b // "null")"' | \
+      while IFS=$'\t' read -r path va vb; do
+        printf '  %s%-50s%s\n' "$C_BOLD" "$path" "$C_RESET"
+        printf '    %sa:%s %s\n' "$C_RED"   "$C_RESET" "$va"
+        printf '    %sb:%s %s\n' "$C_GREEN" "$C_RESET" "$vb"
+      done
+  else
+    echo "$diff_json" | emit_pretty_or_json
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: compass — top processes by runs / recency / failure rate
+# --------------------------------------------------------------------------- #
+
+cmd_compass() {
+  # Paginate up to 1000 instances in batches of 200.
+  local all_instances="[]"
+  local offset=0 batch_size=200 fetched=0
+
+  while true; do
+    local resp; resp=$(api_get "/sop/instances?limit=${batch_size}&offset=${offset}")
+    local batch; batch=$(echo "$resp" | jq -c '.instances // []')
+    local count; count=$(echo "$batch" | jq 'length')
+    (( count == 0 )) && break
+
+    all_instances=$(jq -nc --argjson acc "$all_instances" --argjson new "$batch" '$acc + $new')
+    (( fetched += count ))
+    (( offset  += batch_size ))
+    (( fetched >= 1000 || count < batch_size )) && break
+  done
+
+  # TODO: cost dimension once server exposes /sop/metrics with per-instance cost
+
+  local stats
+  stats=$(echo "$all_instances" | jq -c '
+    group_by(.process.name) |
+    map(
+      {
+        name:         .[0].process.name,
+        total:        length,
+        latest:       (map(.started_at) | sort | last),
+        failure_count:(map(select(.state == "failed" or .state == "cancelled")) | length),
+        failure_rate: ((map(select(.state == "failed" or .state == "cancelled")) | length) / length)
+      }
+    ) | {
+      by_runs:         (sort_by(-.total)         | .[0:10]),
+      by_recency:      (sort_by(.latest)  | reverse | .[0:10]),
+      by_failure_rate: (sort_by(-.failure_rate)  | .[0:10])
+    }
+  ')
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local by_runs by_recency by_failure
+    by_runs=$(   echo "$stats" | jq -c '.by_runs')
+    by_recency=$(echo "$stats" | jq -c '.by_recency')
+    by_failure=$(echo "$stats" | jq -c '.by_failure_rate')
+
+    printf '%sMost-run:%s\n' "$C_BOLD" "$C_RESET"
+    echo "$by_runs" | jq -r '.[] | "  \(.name) × \(.total)"'
+
+    printf '\n%sMost-recent:%s\n' "$C_BOLD" "$C_RESET"
+    echo "$by_recency" | jq -r '.[] | "  \(.name)  \(.latest // "-")"'
+
+    printf '\n%sHighest failure rate:%s\n' "$C_BOLD" "$C_RESET"
+    echo "$by_failure" | jq -r '.[] | "  \(.name)  \(.failure_rate * 100 | round | tostring)%  (\(.failure_count)/\(.total))"'
+  else
+    echo "$stats" | emit_pretty_or_json
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: history — discoverable alias for instances --process X
+# --------------------------------------------------------------------------- #
+
+cmd_history() {
+  local process="" limit=10
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --process) process="$2"; shift 2 ;;
+      --limit)   limit="$2";   shift 2 ;;
+      *) die "unknown flag for history: $1" ;;
+    esac
+  done
+  [[ -z "$process" ]] && die "usage: opensop history --process <name> [--limit N]"
+  # Delegate to cmd_instances — share backend call, no duplication.
+  cmd_instances --process "$process" --limit "$limit"
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: dry-run — client-side preview, NO server execution
+# --------------------------------------------------------------------------- #
+
+# walk_steps_preview SCHEMA_JSON
+#   Walks process.steps and emits a human-readable "would ..." description per step.
+walk_steps_preview() {
+  local schema_json="$1"
+  echo "$schema_json" | jq -r '
+    .process.steps[]? |
+    . as $s |
+    ($s.id // "?") as $id |
+    ($s.type // "unknown") as $t |
+    # Collect output field names; fall back to input field names for form steps.
+    ([($s.outputs // [])[]?.name // empty] |
+      if length == 0 then [($s.inputs // [])[]?.name // empty] else . end |
+      map(select(. != null and . != "")) | join(", ")) as $fields |
+    if   $t == "form" then
+      "  \($id)  form          → would request input for fields: \($fields)"
+    elif $t == "automated" then
+      "  \($id)  automated     → would run script: \($s.run // $s.script // $s.runs // "(unspecified)")\(if $s.timeout then " (timeout: \($s.timeout)s)" else "" end)"
+    elif $t == "webhook" then
+      "  \($id)  webhook       → would \($s.method // "POST") \($s.url // "(unspecified)") (response_mode: \($s.response_mode // "sync"))"
+    elif $t == "notification" then
+      "  \($id)  notification  → would send via \($s.channel // "unspecified") to \($s.to // "(unspecified)")"
+    elif $t == "judgment" then
+      "  \($id)  judgment      → would route to LLM (model: \($s.model // "default"), confidence_threshold: \($s.confidence_threshold // "unset")); fallback: \($s.escalation // "none")"
+    elif $t == "approval" then
+      "  \($id)  approval      → would await approval from \(($s.approvers // ["(unspecified)"]) | map(tostring) | join(", "))"
+    elif $t == "subprocess" then
+      "  \($id)  subprocess    → would start subprocess: \($s.process // $s.name // "(unspecified)")"
+    elif $t == "loop" then
+      "  \($id)  loop          → would iterate over \($s.for_each_source // $s.for_each // "(unspecified)"), body: \($s.body.id // "(unspecified)")"
+    elif $t == "llm" then
+      "  \($id)  llm           → would call \($s.model // "default") with prompt template"
+    elif $t == "wait" then
+      "  \($id)  wait          → would pause for \(if $s.seconds then "\($s.seconds)s" else "(unspecified)" end)\(if $s.until then " or until \($s.until)" else "" end)"
+    else
+      "  \($id)  \($t)  → (unknown step type — would execute as configured)"
+    end
+  '
+}
+
+cmd_dry_run() {
+  [[ $# -lt 1 ]] && die "usage: opensop dry-run <name> [--inputs '<json>' | --input KEY=VALUE ...] [--inputs-file <path>]"
+  local name="$1"; shift
+
+  # Parse flags — only input flags (no metadata/etc for dry-run).
+  local json_blob="" file_path=""
+  local -a kv_pairs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --inputs)       json_blob="$2";  shift 2 ;;
+      --inputs-file)  file_path="$2";  shift 2 ;;
+      --input)        kv_pairs+=("$2"); shift 2 ;;
+      *) die "unknown flag for dry-run: $1" ;;
+    esac
+  done
+
+  # Build input object.
+  local inputs="{}"
+  if [[ -n "$json_blob" ]]; then
+    inputs=$(echo "$json_blob" | jq .) || die "invalid JSON in --inputs"
+  elif [[ -n "$file_path" ]]; then
+    inputs=$(jq . "$file_path") || die "could not read $file_path as JSON"
+  fi
+  if (( ${#kv_pairs[@]} > 0 )); then
+    for kv in "${kv_pairs[@]}"; do
+      [[ "$kv" != *=* ]] && die "--input expects KEY=VALUE, got: $kv"
+      local k="${kv%%=*}" v="${kv#*=}"
+      if echo "$v" | jq -e . >/dev/null 2>&1; then
+        inputs=$(echo "$inputs" | jq --arg k "$k" --argjson v "$v" '.[$k] = $v')
+      else
+        inputs=$(echo "$inputs" | jq --arg k "$k" --arg v "$v" '.[$k] = $v')
+      fi
+    done
+  fi
+
+  # 1. Fetch schema (server round-trip for schema only, NOT execution).
+  local schema; schema=$(api_get "/sop/$name/schema")
+
+  # 2. Validate inputs against process.inputs definition.
+  local errors_json
+  errors_json=$(echo "$schema" | jq -c \
+    --argjson supplied "$inputs" '
+    [ .process.inputs[]? |
+      . as $field |
+      ($supplied[$field.name]) as $val |
+      # Required check.
+      (if ($field.required == true) and ($val == null) then
+        {path: ("inputs." + $field.name), message: ("required field missing: " + $field.name)}
+      else null end),
+      # Type check (best-effort).
+      (if $val != null then
+        if   $field.type == "number"  and ($val | type) != "number"  then
+          {path: ("inputs." + $field.name), message: ($field.name + " must be a number")}
+        elif $field.type == "boolean" and ($val | type) != "boolean" then
+          {path: ("inputs." + $field.name), message: ($field.name + " must be a boolean")}
+        elif $field.type == "enum" and ($field.values != null) and ([$field.values[] | . == $val] | any | not) then
+          {path: ("inputs." + $field.name), message: ($field.name + " must be one of: " + ($field.values | join(", ")))}
+        elif $field.type == "string" and $field.format == "email" and ($val | type) == "string" and ($val | test("^[^@]+@[^@]+\\.[^@]+$") | not) then
+          {path: ("inputs." + $field.name), message: ($field.name + " does not look like an email address")}
+        else null end
+      else null end)
+    ] | map(select(. != null))
+  ')
+
+  local valid=true
+  local err_count; err_count=$(echo "$errors_json" | jq 'length')
+  (( err_count > 0 )) && valid=false
+
+  # 3. Walk steps.
+  local steps_preview
+  steps_preview=$(walk_steps_preview "$schema")
+
+  # Build per-step JSON array for JSON output.
+  local steps_json
+  steps_json=$(echo "$schema" | jq -c '
+    [.process.steps[]? | {step_id: .id, type, preview: ("would execute \(.type) step")}]
+  ')
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    printf '%sdry-run:%s %s\n\n' "$C_BOLD" "$C_RESET" "$name"
+
+    printf '%sinputs validation:%s\n' "$C_BOLD" "$C_RESET"
+    if [[ "$valid" == "true" ]]; then
+      ok "inputs valid"
+    else
+      echo "$errors_json" | jq -r '.[] | "  ✗ \(.message)"' | sed "s/^  ✗/$(printf '%s' "${C_RED}✗${C_RESET}")/g"
+      printf '%svalidation failed (%s error(s))%s\n' "$C_RED" "$err_count" "$C_RESET"
+    fi
+
+    printf '\n%sstep preview:%s\n' "$C_BOLD" "$C_RESET"
+    echo "$steps_preview"
+  else
+    local valid_bool; valid_bool=$( [[ "$valid" == "true" ]] && echo 'true' || echo 'false')
+    jq -nc \
+      --arg process "$name" \
+      --argjson valid "$valid_bool" \
+      --argjson validation_errors "$errors_json" \
+      --argjson steps "$steps_json" \
+      '{process: $process, valid: $valid, validation_errors: $validation_errors, steps: $steps}'
+  fi
+
+  [[ "$valid" == "false" ]] && exit 1
+  return 0
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: register — POST a .sop.yaml to /sop/processes/register
+# --------------------------------------------------------------------------- #
+
+cmd_register() {
+  [[ $# -lt 1 ]] && die "usage: opensop register <process.yaml>"
+  local file="$1"
+  [[ ! -f "$file" ]] && die "file not found: $file"
+
+  local yaml_content; yaml_content=$(cat "$file")
+
+  # Try JSON-wrapped first; fall back to raw YAML if 4xx.
+  local body; body=$(jq -nc --arg yaml "$yaml_content" '{yaml: $yaml}')
+  local resp status
+
+  # We need to capture the HTTP status to detect the fallback case.
+  local tmp_resp; tmp_resp=$(mktemp)
+  require_url
+  local url="${OPENSOP_URL%/}/sop/processes/register"
+  local -a curl_args=(-sS -X POST
+    -H "Content-Type: application/json"
+    -H "Accept: application/json"
+    -o "$tmp_resp"
+    -w "%{http_code}")
+  [[ -n "${OPENSOP_TOKEN:-}" ]] && curl_args+=(-H "X-SOP-Token: $OPENSOP_TOKEN")
+  curl_args+=(-d "$body")
+
+  status=$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)
+
+  if [[ "$status" -ge 400 && "$status" -lt 500 ]]; then
+    # Fall back to raw YAML body.
+    curl_args=(-sS -X POST
+      -H "Content-Type: application/x-yaml"
+      -H "Accept: application/json"
+      -o "$tmp_resp"
+      -w "%{http_code}")
+    [[ -n "${OPENSOP_TOKEN:-}" ]] && curl_args+=(-H "X-SOP-Token: $OPENSOP_TOKEN")
+    curl_args+=(--data-binary "@$file")
+    status=$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)
+  fi
+
+  resp=$(cat "$tmp_resp")
+  rm -f "$tmp_resp"
+
+  if [[ "$status" -ge 400 ]]; then
+    local err_code err_msg
+    err_code=$(echo "$resp" | jq -r '.error // "http_error"' 2>/dev/null || echo "http_error")
+    err_msg=$(echo "$resp"  | jq -r '.message // empty'      2>/dev/null || echo "")
+    err "HTTP $status — $err_code${err_msg:+: $err_msg}"
+    if [[ "$status" == "401" || "$status" == "403" ]]; then
+      warn "registration may be admin-restricted; check your token has the right scope,"
+      warn "or register via the dashboard at ${OPENSOP_URL}/admin"
+    fi
+    [[ "$OUTPUT_MODE" == "json" ]] && echo "$resp" >&2
+    exit 1
+  fi
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local pname pversion
+    pname=$(echo "$resp"    | jq -r '.process.name    // .name    // "(unknown)"' 2>/dev/null || echo "(unknown)")
+    pversion=$(echo "$resp" | jq -r '.process.version // .version // "(unknown)"' 2>/dev/null || echo "(unknown)")
+    ok "registered ${pname}@${pversion}"
+  else
+    echo "$resp" | emit_pretty_or_json
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: schema validate — fully client-side YAML lint
+# --------------------------------------------------------------------------- #
+
+# resolve_yaml FILE
+#   Parses a YAML file and outputs normalized JSON. Uses yq (v4+) if available,
+#   falls back to python3 + PyYAML. Exits non-zero if neither is available.
+resolve_yaml() {
+  local file="$1"
+  if command -v yq >/dev/null 2>&1; then
+    yq e -o=json '.' "$file"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import yaml,json,sys; print(json.dumps(yaml.safe_load(open(sys.argv[1]))))' "$file" \
+      || die "python3 YAML parse failed for $file"
+  else
+    die "schema validate needs 'yq' or 'python3' with PyYAML — install one"
+  fi
+}
+
+cmd_schema_validate() {
+  [[ $# -lt 1 ]] && die "usage: opensop schema validate <file.yaml>"
+  local file="$1"
+  [[ ! -f "$file" ]] && die "file not found: $file"
+
+  local doc
+  doc=$(resolve_yaml "$file") || exit 1
+
+  local -a errors=()
+
+  # Helper: add an error.
+  add_error() { errors+=("$1"); }
+
+  # 1. Top-level opensop field.
+  local opensop_ver; opensop_ver=$(echo "$doc" | jq -r '.opensop // empty')
+  [[ -z "$opensop_ver" ]] && add_error "missing top-level 'opensop' version field"
+
+  # 2. process object.
+  local has_process; has_process=$(echo "$doc" | jq 'has("process")')
+  if [[ "$has_process" != "true" ]]; then
+    add_error "missing top-level 'process' object"
+  else
+    for key in name version description; do
+      local kval; kval=$(echo "$doc" | jq -r --arg k "$key" '.process[$k] // empty')
+      [[ -z "$kval" ]] && add_error "process.$key is required but missing or empty"
+    done
+
+    # inputs array.
+    local inputs_type; inputs_type=$(echo "$doc" | jq -r '.process.inputs | type')
+    if [[ "$inputs_type" != "array" ]]; then
+      add_error "process.inputs must be an array (got: $inputs_type)"
+    else
+      # Each input must have name + type.
+      local bad_inputs
+      bad_inputs=$(echo "$doc" | jq -r '
+        .process.inputs | to_entries[] |
+        select((.value.name == null) or (.value.type == null)) |
+        "  input[\(.key)]: missing name or type"
+      ')
+      [[ -n "$bad_inputs" ]] && while IFS= read -r ln; do add_error "$ln"; done <<< "$bad_inputs"
+    fi
+
+    # steps array.
+    local steps_type; steps_type=$(echo "$doc" | jq -r '.process.steps | type')
+    if [[ "$steps_type" != "array" ]]; then
+      add_error "process.steps must be an array (got: $steps_type)"
+    else
+      local known_types='["form","automated","judgment","approval","webhook","notification","subprocess","loop","llm","wait"]'
+      # Each step: must have id + type; type must be known.
+      local bad_steps
+      bad_steps=$(echo "$doc" | jq -r \
+        --argjson known "$known_types" '
+        .process.steps | to_entries[] |
+        . as $e | $e.value as $s |
+        (
+          (if $s.id == null then "  step[\($e.key)]: missing id" else "" end),
+          (if $s.type == null then "  step[\($e.key)]: missing type" else "" end),
+          (if $s.type != null and ([$known[] | . == $s.type] | any | not) then
+            "  step \($s.id // $e.key): unknown type \"\($s.type)\" (valid: \($known | join(", ")))"
+          else "" end)
+        ) | select(length > 0)
+      ')
+      [[ -n "$bad_steps" ]] && while IFS= read -r ln; do add_error "$ln"; done <<< "$bad_steps"
+    fi
+  fi
+
+  # 3. Validate from: reference strings — must match steps.X.outputs.Y or process.inputs.Y.
+  local bad_refs
+  bad_refs=$(echo "$doc" | jq -r '
+    [ .. | strings | select(test("^(steps\\.[^.]+\\.outputs\\.[^.]+|process\\.inputs\\.[^.]+)$") | not)
+      | select(test("^steps\\.") or test("^process\\.inputs\\.")) ] |
+    map("  invalid from: reference: " + .) | .[]
+  ')
+  [[ -n "$bad_refs" ]] && while IFS= read -r ln; do add_error "$ln"; done <<< "$bad_refs"
+
+  local valid=true
+  (( ${#errors[@]} > 0 )) && valid=false
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    printf '%sschema validate:%s %s\n' "$C_BOLD" "$C_RESET" "$file"
+    if [[ "$valid" == "true" ]]; then
+      ok "valid"
+    else
+      for e in "${errors[@]}"; do
+        printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$e"
+      done
+      printf '%s%s error(s) found%s\n' "$C_RED" "${#errors[@]}" "$C_RESET"
+    fi
+  else
+    local errors_json="[]"
+    if (( ${#errors[@]} > 0 )); then
+      for e in "${errors[@]}"; do
+        errors_json=$(echo "$errors_json" | jq --arg msg "$e" '. + [{path: "unknown", message: $msg}]')
+      done
+    fi
+    local valid_bool; valid_bool=$( [[ "$valid" == "true" ]] && echo 'true' || echo 'false')
+    jq -nc \
+      --arg file "$file" \
+      --argjson valid "$valid_bool" \
+      --argjson errors "$errors_json" \
+      '{file: $file, valid: $valid, errors: $errors}'
+  fi
+
+  [[ "$valid" == "false" ]] && exit 1
+  return 0
+}
+
+# --------------------------------------------------------------------------- #
 # Main dispatch
 # --------------------------------------------------------------------------- #
 
@@ -769,12 +1275,14 @@ main() {
   require_curl
   require_jq
 
-  # Strip global flags (--json / --pretty / --help / --version) anywhere.
+  # Strip global flags (--json / --pretty / --local / --help / --version) anywhere.
   local -a args=()
+  local _local_flag=false
   for a in "$@"; do
     case "$a" in
       --json)              OUTPUT_MODE="json" ;;
       --pretty)            OUTPUT_MODE="pretty" ;;
+      --local)             _local_flag=true ;;
       --help|-h|help)      cmd_help; exit 0 ;;
       --version|-v|version) cmd_version; exit 0 ;;
       *) args+=("$a") ;;
@@ -789,16 +1297,31 @@ main() {
   local cmd="$1"; shift
   load_config
 
+  # --local overrides OPENSOP_URL to localhost:3000 for this invocation.
+  [[ "$_local_flag" == "true" ]] && OPENSOP_URL="http://localhost:3000"
+
   case "$cmd" in
     list)       cmd_list "$@" ;;
     search)     cmd_search "$@" ;;
     suggest)    cmd_suggest "$@" ;;
-    schema)     cmd_schema "$@" ;;
+    schema)
+      # schema can be: schema <name>  OR  schema validate <file>
+      if [[ "${1:-}" == "validate" ]]; then
+        shift; cmd_schema_validate "$@"
+      else
+        cmd_schema "$@"
+      fi
+      ;;
     run)        cmd_run "$@" ;;
+    dry-run)    cmd_dry_run "$@" ;;
     status)     cmd_status "$@" ;;
     steps)      cmd_steps "$@" ;;
     submit)     cmd_submit "$@" ;;
     cancel)     cmd_cancel "$@" ;;
+    diff)       cmd_diff "$@" ;;
+    compass)    cmd_compass "$@" ;;
+    history)    cmd_history "$@" ;;
+    register)   cmd_register "$@" ;;
     instances)  cmd_instances "$@" ;;
     config)     cmd_config "$@" ;;
     *)          die "unknown command '$cmd'. run 'opensop help' for usage." ;;
