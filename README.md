@@ -6,6 +6,8 @@ A small bash CLI for talking to any [OpenSOP](https://github.com/Chosen9115/open
 
 OpenSOP is an open standard for executable processes — define a YAML, get a typed REST API. This CLI is the smallest useful client for that API: a thin wrapper around the `/sop/*` endpoints, with a tiny local cache so you can pass instance IDs around without re-typing process names.
 
+It works against any conformant OpenSOP server. The reference implementation is the [opensop Rails app](https://github.com/Chosen9115/opensop); the public demo at `https://demo.opensop.ai` runs it. You do not need to self-host anything to try the CLI.
+
 It exists so agents (and humans) can use OpenSOP from any terminal, immediately, without writing curl invocations by hand.
 
 ## Install
@@ -42,7 +44,22 @@ opensop config set token demo-public-token-resets-daily
 Discover what processes are available:
 
 ```bash
-opensop list
+$ opensop list
+agent-pr-review                  developer-tooling, code-review, agent-harness, ai  An agent reviews a PR diff…
+appsignal-incident-fix           appsignal, incident-management, fix       Classify an AppSignal incident…
+appsignal-regression-check       appsignal, regression-check               After a fix PR merges, wait 3 days…
+customer-onboarding              banking, onboarding, compliance, kyb      Onboard a new business customer…
+expense-approval                 finance, expense, approval, hr            Employee submits an expense; an LLM…
+lead-qualification               growth, sales, qualification              Qualify an inbound lead and score…
+release-deploy                   devops, release, deployment, cicd         Release engineer fills release notes…
+support-ticket-triage            support, triage, customer-service         Inbound support ticket is categorized…
+```
+
+Don't know the process name? Search by intent:
+
+```bash
+$ opensop search lead
+2     lead-qualification           (growth, sales, qualification)  Qualify an inbound lead and score their fit
 ```
 
 Read a process's full definition:
@@ -73,6 +90,7 @@ Advance a paused step (form / judgment / approval):
 opensop submit <instance-id> collect-context \
   --output budget=12000 \
   --output timeline=immediate \
+  --output notes="Strong fit, spoke to CEO" \
   --decided-by agent:my-bot \
   --confidence 0.92
 ```
@@ -88,6 +106,72 @@ List all instances:
 ```bash
 opensop instances --state running --limit 20
 ```
+
+## Worked example
+
+A full `lead-qualification` run from start to completion — what each command returns and what to do next.
+
+**Step 1: start the instance**
+
+```
+$ opensop run lead-qualification \
+    --input lead_name="Ana García" \
+    --input lead_email=ana@example.com \
+    --input source=website
+
+✓ started lead-qualification
+  id:    e33baee4-84d3-4d04-b902-2f50437d8191
+  state: running
+
+waiting:
+  collect-context (form): waiting_for_input
+
+next:  opensop status e33baee4-84d3-4d04-b902-2f50437d8191
+```
+
+The instance is running and paused at the first step — a `form` step waiting for human or agent input.
+
+**Step 2: inspect the steps**
+
+```
+$ opensop steps e33baee4-84d3-4d04-b902-2f50437d8191
+
+collect-context    form           active    waiting_for_input
+score-lead         automated      pending
+notify-team        notification   pending
+```
+
+**Step 3: submit the paused step**
+
+```
+$ opensop submit e33baee4-84d3-4d04-b902-2f50437d8191 collect-context \
+    --output budget=12000 \
+    --output timeline=immediate \
+    --output notes="Strong fit, spoke to CEO" \
+    --decided-by agent:my-bot \
+    --confidence 0.92
+
+✓ submitted collect-context (completed) — instance running
+next:  opensop status e33baee4-84d3-4d04-b902-2f50437d8191
+```
+
+The form step is complete. The runtime moves to `score-lead` (automated) and `notify-team` (notification) automatically.
+
+**Step 4: poll until done**
+
+```
+$ opensop status e33baee4-84d3-4d04-b902-2f50437d8191
+
+instance: e33baee4-84d3-4d04-b902-2f50437d8191
+process:  lead-qualification
+state:    completed (2026-05-08T20:28:41Z)
+
+  ✓ collect-context              form
+  ✓ score-lead                   automated
+  ✓ notify-team                  notification
+```
+
+That's the run-pause-submit-poll lifecycle. The receipt is stored in the runtime's database; `opensop instances --process lead-qualification` will show all historical runs.
 
 ## Output modes
 
@@ -147,7 +231,26 @@ Override per-call via env vars:
 OPENSOP_URL=https://prod.opensop.ai opensop list
 ```
 
-The local cache lives at `~/.opensop/instances.tsv` — TSV of `id`, `name`, `created_at`, `url`. Safe to delete; the CLI rebuilds it from `/sop/instances` on the next miss.
+## Subcommand reference
+
+| Command | Purpose |
+|---|---|
+| `opensop list [--tag <tag>]` | List all registered processes, optionally filtered by tag |
+| `opensop search <keyword> [...]` | Ranked text search over process names, descriptions, and tags |
+| `opensop suggest "<task description>"` | Describe a task in prose; get the top-matching process back |
+| `opensop schema <name>` | Full process definition (`GET /sop/<name>/schema`) |
+| `opensop run <name> [opts]` | Start an instance (`POST /sop/<name>/start`) |
+| `opensop status <id>` | Instance state (`GET /sop/<name>/<id>`) |
+| `opensop steps <id>` | All steps of an instance (`GET /sop/<name>/<id>/steps`) |
+| `opensop submit <id> <step-id> [opts]` | Advance a paused step (`POST /sop/<name>/<id>/steps/<step-id>/submit`) |
+| `opensop cancel <id> [--reason TEXT]` | Cancel an instance (`POST /sop/<name>/<id>/cancel`) |
+| `opensop instances [--state X] [--process Y]` | Paginated list (`GET /sop/instances`) |
+| `opensop config [set <key> <value>]` | Manage config |
+| `opensop help` | Full help |
+
+## Local cache
+
+The CLI caches `id → process name` mappings in `~/.opensop/instances.tsv` — a plain TSV of `id`, `name`, `created_at`, `url`. This is why `opensop status <id>` and `opensop steps <id>` only need the instance ID; you don't have to re-type the process name. Safe to delete at any time; the CLI rebuilds it from `/sop/instances` on the next cache miss.
 
 ## Authentication
 
@@ -164,20 +267,7 @@ The CLI was designed so an agent can use OpenSOP without writing HTTP requests. 
 
 The short version: when an agent recognizes that what it's about to do is a multi-step process, it `opensop schema`s a candidate process, `opensop run`s it, polls `opensop status`, and submits step outputs as it works. Receipts persist in the runtime's database — observable by humans, replayable across runs.
 
-## Subcommand reference
-
-| Command | Purpose |
-|---|---|
-| `opensop list` | List all registered processes (`GET /sop/`) |
-| `opensop schema <name>` | Full process definition (`GET /sop/<name>/schema`) |
-| `opensop run <name> [opts]` | Start an instance (`POST /sop/<name>/start`) |
-| `opensop status <id>` | Instance state (`GET /sop/<name>/<id>`) |
-| `opensop steps <id>` | All steps of an instance (`GET /sop/<name>/<id>/steps`) |
-| `opensop submit <id> <step-id> [opts]` | Advance a paused step (`POST /sop/<name>/<id>/steps/<step-id>/submit`) |
-| `opensop cancel <id> [--reason TEXT]` | Cancel an instance (`POST /sop/<name>/<id>/cancel`) |
-| `opensop instances [--state X] [--process Y]` | Paginated list (`GET /sop/instances`) |
-| `opensop config [set <key> <value>]` | Manage config |
-| `opensop help` | Full help |
+For discovery, agents should use `opensop search` or `opensop suggest` rather than scanning the full `list` output — they surface the right process from intent, not from name recall.
 
 ## Limitations
 

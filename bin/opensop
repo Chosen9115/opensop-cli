@@ -16,7 +16,7 @@ set -euo pipefail
 # Constants & paths
 # --------------------------------------------------------------------------- #
 
-readonly OPENSOP_CLI_VERSION="0.1.0"
+readonly OPENSOP_CLI_VERSION="0.2.0"
 readonly OPENSOP_HOME="${OPENSOP_HOME:-$HOME/.opensop}"
 readonly CONFIG_FILE="$OPENSOP_HOME/config"
 readonly CACHE_FILE="$OPENSOP_HOME/instances.tsv"
@@ -213,7 +213,9 @@ ${C_BOLD}USAGE${C_RESET}
   opensop <command> [args]
 
 ${C_BOLD}DISCOVERY${C_RESET}
-  list                          list all registered processes
+  list [--tag <tag>]            list all registered processes (optionally filtered by tag)
+  search <keyword> [...]        ranked text search over process names, descriptions, tags
+  suggest "<task description>"  inverse retrieval — describe a task, get a process recommendation
   schema <name>                 show the full definition of a process
 
 ${C_BOLD}EXECUTION${C_RESET}
@@ -312,11 +314,26 @@ cmd_config() {
 # --------------------------------------------------------------------------- #
 
 cmd_list() {
+  local tag_filter=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tag) tag_filter="$2"; shift 2 ;;
+      *) die "unknown flag for list: $1" ;;
+    esac
+  done
+
   local resp; resp=$(api_get "/sop/")
+
+  # Client-side tag filter.
+  if [[ -n "$tag_filter" ]]; then
+    resp=$(echo "$resp" | jq --arg tag "$tag_filter" \
+      '{processes: [.processes[] | select(.tags | index($tag) != null)]}')
+  fi
+
   if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
-    echo "$resp" | jq -r '.processes[] | "\(.name)\t\(.version)\t\(.description // "")"' | \
-      while IFS=$'\t' read -r name version desc; do
-        printf '%s%-30s%s %s%s%s  %s\n' "$C_BOLD" "$name" "$C_RESET" "$C_DIM" "v$version" "$C_RESET" "$desc"
+    echo "$resp" | jq -r '.processes[] | "\(.name)\t\(.tags // [] | join(", "))\t\(.description // "")"' | \
+      while IFS=$'\t' read -r name tags desc; do
+        printf '%s%-30s%s %-40s  %s\n' "$C_BOLD" "$name" "$C_RESET" "${C_DIM}${tags}${C_RESET}" "$desc"
       done
   else
     echo "$resp" | emit_pretty_or_json
@@ -590,6 +607,161 @@ cmd_instances() {
 }
 
 # --------------------------------------------------------------------------- #
+# Subcommand: search / suggest — ranked text search helpers
+# --------------------------------------------------------------------------- #
+
+# score_processes KEYWORDS_JSON PROCESSES_JSON
+#   Scores each process by counting case-insensitive keyword matches across
+#   name + description + tags. Emits JSON array sorted by score desc.
+#   KEYWORDS_JSON: a JSON array of strings.
+#   PROCESSES_JSON: the full /sop/ response object.
+score_processes() {
+  local keywords_json="$1"
+  local processes_json="$2"
+
+  echo "$processes_json" | jq -c \
+    --argjson kws "$keywords_json" '
+    [ .processes[] |
+      . as $p |
+      # Concatenate searchable text: name + description + tags joined.
+      (($p.name // "") + " " +
+       ($p.description // "") + " " +
+       (($p.tags // []) | join(" "))) | ascii_downcase as $text |
+      # Sum word-boundary matches; skip single-char keywords (stop words like "a", "I").
+      ($kws | map(
+        . | ascii_downcase as $kw |
+        if ($kw | length) < 2 then 0
+        else
+          ("\\b" + $kw + "\\b") as $pat |
+          ($text | [scan($pat)] | length)
+        end
+      ) | add) as $score |
+      select($score >= 1) |
+      {name: $p.name, score: $score, description: ($p.description // ""), tags: ($p.tags // [])}
+    ] | sort_by(-.score)
+  '
+}
+
+cmd_search() {
+  [[ $# -lt 1 ]] && die "usage: opensop search <keyword> [keyword2 ...]"
+  local -a keywords=("$@")
+  local keywords_json
+  keywords_json=$(printf '%s\n' "${keywords[@]}" | jq -Rsc '[split("\n")[] | select(length > 0)]')
+
+  local resp; resp=$(api_get "/sop/")
+  local results; results=$(score_processes "$keywords_json" "$resp")
+
+  # Top 5 only.
+  local top5; top5=$(echo "$results" | jq -c '.[0:5]')
+
+  local count; count=$(echo "$top5" | jq 'length')
+  if [[ "$count" -eq 0 ]]; then
+    printf 'no matches for: %s\n' "${keywords[*]}" >&2
+    exit 0
+  fi
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    echo "$top5" | jq -r '.[] | "\(.score)\t\(.name)\t\(.tags | join(", "))\t\(.description)"' | \
+      while IFS=$'\t' read -r score name tags desc; do
+        # Truncate description to 60 chars for readability.
+        local snippet="${desc:0:60}"
+        [[ "${#desc}" -gt 60 ]] && snippet="${snippet}…"
+        printf '%s%-4s%s  %s%-30s%s %s%s%s  %s\n' \
+          "$C_DIM" "$score" "$C_RESET" \
+          "$C_BOLD" "$name" "$C_RESET" \
+          "$C_DIM" "(${tags})" "$C_RESET" \
+          "$snippet"
+      done
+  else
+    local query_arr; query_arr=$(printf '%s\n' "${keywords[@]}" | jq -Rsc '[split("\n")[] | select(length > 0)]')
+    echo "$top5" | jq -c --argjson q "$query_arr" '{query: $q, results: .}'
+  fi
+}
+
+cmd_suggest() {
+  [[ $# -lt 1 ]] && die "usage: opensop suggest \"<task description>\""
+  # Treat all positional args as one concatenated task string.
+  local task="$*"
+  local -a keywords
+  # Split task into words.
+  IFS=' ' read -r -a keywords <<< "$task"
+
+  local threshold="0.0"
+  # Check for --threshold flag: re-parse args to extract it.
+  local -a remaining_args=("$@")
+  local -a parsed_keywords=()
+  local i=0
+  while [[ $i -lt ${#remaining_args[@]} ]]; do
+    local a="${remaining_args[$i]}"
+    if [[ "$a" == "--threshold" ]]; then
+      (( i++ ))
+      threshold="${remaining_args[$i]:-0.0}"
+    else
+      parsed_keywords+=("$a")
+    fi
+    (( i++ ))
+  done
+
+  # Rebuild task and keywords from parsed args (stripping --threshold).
+  if (( ${#parsed_keywords[@]} > 0 )); then
+    task="${parsed_keywords[*]}"
+    IFS=' ' read -r -a keywords <<< "$task"
+  fi
+
+  [[ ${#keywords[@]} -eq 0 ]] && die "usage: opensop suggest \"<task description>\""
+
+  local keywords_json
+  keywords_json=$(printf '%s\n' "${keywords[@]}" | jq -Rsc '[split("\n")[] | select(length > 0)]')
+  local num_kws="${#keywords[@]}"
+
+  local resp; resp=$(api_get "/sop/")
+  local results; results=$(score_processes "$keywords_json" "$resp")
+
+  # Top-1 with confidence.
+  local top1; top1=$(echo "$results" | jq -c --argjson nk "$num_kws" '
+    if length == 0 then null
+    else
+      .[0] |
+      . + {confidence: ([1.0, (.score / ([$nk, 1] | max))] | min)}
+    end
+  ')
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    if [[ "$top1" == "null" ]]; then
+      printf 'no clear match for "%s"\n' "$task"
+    else
+      local name confidence desc
+      name=$(echo "$top1" | jq -r '.name')
+      confidence=$(echo "$top1" | jq -r '.confidence | (. * 100 | round / 100 | tostring)')
+      desc=$(echo "$top1" | jq -r '.description')
+      # Check threshold.
+      local passes; passes=$(echo "$top1" | jq -r --arg t "$threshold" '(.confidence >= ($t | tonumber)) | tostring')
+      if [[ "$passes" == "true" ]]; then
+        printf '%s→%s this looks like %s%s%s (confidence: %s)\n' \
+          "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET" "$confidence"
+        printf '  %s\n' "$desc"
+      else
+        printf 'no clear match for "%s"\n' "$task"
+      fi
+    fi
+  else
+    local match_json
+    if [[ "$top1" == "null" ]]; then
+      match_json="null"
+    else
+      # Check threshold.
+      local passes; passes=$(echo "$top1" | jq -r --arg t "$threshold" '(.confidence >= ($t | tonumber)) | tostring')
+      if [[ "$passes" == "true" ]]; then
+        match_json=$(echo "$top1" | jq -c '{name, confidence, description}')
+      else
+        match_json="null"
+      fi
+    fi
+    jq -nc --arg task "$task" --argjson match "$match_json" '{task: $task, match: $match}'
+  fi
+}
+
+# --------------------------------------------------------------------------- #
 # Main dispatch
 # --------------------------------------------------------------------------- #
 
@@ -619,6 +791,8 @@ main() {
 
   case "$cmd" in
     list)       cmd_list "$@" ;;
+    search)     cmd_search "$@" ;;
+    suggest)    cmd_suggest "$@" ;;
     schema)     cmd_schema "$@" ;;
     run)        cmd_run "$@" ;;
     status)     cmd_status "$@" ;;
