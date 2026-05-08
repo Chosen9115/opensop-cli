@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+#
+# opensop — thin CLI client for OpenSOP runtimes
+#
+# Talks to any OpenSOP server's /sop/* HTTP API. Stateless except for a
+# small local cache that maps instance IDs back to process names so most
+# commands can take just an id.
+#
+# Usage:  opensop <command> [args]
+# Help:   opensop help
+# Repo:   https://github.com/Chosen9115/opensop-cli
+
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# Constants & paths
+# --------------------------------------------------------------------------- #
+
+readonly OPENSOP_CLI_VERSION="0.1.0"
+readonly OPENSOP_HOME="${OPENSOP_HOME:-$HOME/.opensop}"
+readonly CONFIG_FILE="$OPENSOP_HOME/config"
+readonly CACHE_FILE="$OPENSOP_HOME/instances.tsv"
+
+# --------------------------------------------------------------------------- #
+# Output helpers
+# --------------------------------------------------------------------------- #
+
+is_tty() { [[ -t 1 ]]; }
+
+# Color support — only when stdout is a TTY and NO_COLOR is unset.
+if is_tty && [[ -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""
+  C_YELLOW=""; C_BLUE=""; C_CYAN=""
+fi
+
+err()  { printf '%sopensop:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+warn() { printf '%sopensop:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+info() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+
+die() { err "$*"; exit 1; }
+
+# Output mode: pretty | json. Set by --json / --pretty flags or auto-detected.
+OUTPUT_MODE="auto"
+
+emit_json() {
+  # Print compact JSON (stdin) — used for --json and piped output.
+  jq -c .
+}
+
+emit_pretty_or_json() {
+  # If TTY and not --json, pretty-print. Else compact JSON.
+  local mode="$OUTPUT_MODE"
+  [[ "$mode" == "auto" ]] && { is_tty && mode="pretty" || mode="json"; }
+  if [[ "$mode" == "json" ]]; then
+    jq -c .
+  else
+    jq .
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Dependency check
+# --------------------------------------------------------------------------- #
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required. Install: brew install jq | apt install jq"
+}
+
+require_curl() {
+  command -v curl >/dev/null 2>&1 || die "curl is required (it should be on every Unix already)."
+}
+
+# --------------------------------------------------------------------------- #
+# Config — ~/.opensop/config is sourced as bash key=value pairs.
+# Vars: OPENSOP_URL, OPENSOP_TOKEN
+# --------------------------------------------------------------------------- #
+
+ensure_home() {
+  mkdir -p "$OPENSOP_HOME"
+  chmod 700 "$OPENSOP_HOME"
+}
+
+load_config() {
+  ensure_home
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+  # Env vars override config file.
+  : "${OPENSOP_URL:=${OPENSOP_URL_OVERRIDE:-}}"
+  : "${OPENSOP_TOKEN:=${OPENSOP_TOKEN_OVERRIDE:-}}"
+}
+
+save_config() {
+  ensure_home
+  umask 077
+  cat > "$CONFIG_FILE" <<EOF
+# OpenSOP CLI config — managed by 'opensop config'
+# Override either of these via env vars (OPENSOP_URL / OPENSOP_TOKEN) at runtime.
+OPENSOP_URL="${OPENSOP_URL:-}"
+OPENSOP_TOKEN="${OPENSOP_TOKEN:-}"
+EOF
+  chmod 600 "$CONFIG_FILE"
+}
+
+require_url() {
+  [[ -n "${OPENSOP_URL:-}" ]] || die "OPENSOP_URL is not set. Run: opensop config set url <https://your-server>"
+}
+
+# --------------------------------------------------------------------------- #
+# HTTP — every API call goes through these.
+#
+# api_call METHOD PATH [BODY]
+#   - prints response body to stdout
+#   - exits non-zero on HTTP >= 400 (with error printed to stderr)
+# --------------------------------------------------------------------------- #
+
+api_call() {
+  local method="$1"; local path="$2"; local body="${3:-}"
+  require_url
+  local url="${OPENSOP_URL%/}${path}"
+  local tmp_body
+  tmp_body=$(mktemp)
+
+  local -a curl_args=(
+    -sS
+    -X "$method"
+    -H "Content-Type: application/json"
+    -H "Accept: application/json"
+    -o "$tmp_body"
+    -w "%{http_code}"
+  )
+
+  [[ -n "${OPENSOP_TOKEN:-}" ]] && curl_args+=(-H "X-SOP-Token: $OPENSOP_TOKEN")
+  [[ -n "$body" ]] && curl_args+=(-d "$body")
+
+  local status
+  if ! status=$(curl "${curl_args[@]}" "$url"); then
+    rm -f "$tmp_body"
+    die "request failed: $method $url"
+  fi
+
+  if [[ "$status" -ge 400 ]]; then
+    local err_msg err_code
+    err_code=$(jq -r '.error // "http_error"' "$tmp_body" 2>/dev/null || echo "http_error")
+    err_msg=$(jq -r '.message // empty' "$tmp_body" 2>/dev/null || echo "")
+    err "HTTP $status — $err_code${err_msg:+: $err_msg}"
+    [[ "$OUTPUT_MODE" == "json" ]] && cat "$tmp_body" >&2
+    rm -f "$tmp_body"
+    exit 1
+  fi
+  cat "$tmp_body"
+  rm -f "$tmp_body"
+}
+
+api_get()  { api_call GET  "$1"; }
+api_post() { api_call POST "$1" "${2:-{\}}"; }
+
+# --------------------------------------------------------------------------- #
+# Local instance cache — TSV: id\tname\tcreated_at\turl
+# Lets `opensop status <id>` work without re-passing the process name.
+# --------------------------------------------------------------------------- #
+
+cache_instance() {
+  local id="$1" name="$2"
+  ensure_home
+  touch "$CACHE_FILE"
+  # Drop existing row for this id (if any), then append fresh.
+  grep -v "^${id}	" "$CACHE_FILE" > "${CACHE_FILE}.tmp" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\n' "$id" "$name" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${OPENSOP_URL:-}" >> "${CACHE_FILE}.tmp"
+  mv "${CACHE_FILE}.tmp" "$CACHE_FILE"
+}
+
+lookup_name() {
+  # Resolve instance id → process name. Cache first, then /sop/instances scan.
+  local id="$1"
+  if [[ -f "$CACHE_FILE" ]]; then
+    local hit
+    hit=$(awk -F'\t' -v id="$id" '$1 == id { print $2; exit }' "$CACHE_FILE")
+    [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+  fi
+  # Cache miss — fetch all instances and grep.
+  warn "id $id not in local cache; scanning /sop/instances..."
+  local resp name
+  resp=$(api_get "/sop/instances?limit=200")
+  name=$(echo "$resp" | jq -r --arg id "$id" '.instances[] | select(.id == $id) | .process.name' | head -1)
+  if [[ -z "$name" ]]; then
+    die "instance $id not found on $OPENSOP_URL (check the id, or set --state and re-list with 'opensop instances')"
+  fi
+  cache_instance "$id" "$name"
+  echo "$name"
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: help
+# --------------------------------------------------------------------------- #
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}opensop${C_RESET} — thin CLI for OpenSOP runtimes (v$OPENSOP_CLI_VERSION)
+
+${C_BOLD}USAGE${C_RESET}
+  opensop <command> [args]
+
+${C_BOLD}DISCOVERY${C_RESET}
+  list                          list all registered processes
+  schema <name>                 show the full definition of a process
+
+${C_BOLD}EXECUTION${C_RESET}
+  run <name> [opts]             start a new instance of a process
+  status <id>                   show the current state of an instance
+  steps <id>                    show all steps of an instance
+  submit <id> <step-id> [opts]  submit outputs to advance a paused step
+  cancel <id> [--reason TEXT]   cancel a running instance
+
+${C_BOLD}ADMIN${C_RESET}
+  instances [--state X] [--process Y]   list instances (paginated)
+
+${C_BOLD}CONFIG${C_RESET}
+  config                        show current config
+  config set url <URL>          set the server URL
+  config set token <TOKEN>      set the API token
+
+${C_BOLD}GLOBAL OPTIONS${C_RESET}
+  --json                        emit JSON to stdout (default when piped)
+  --pretty                      pretty-print (default in TTY)
+  --help, -h                    show this help
+  --version, -v                 print version
+
+${C_BOLD}INPUT FORMS (for run/submit)${C_RESET}
+  --inputs '<json>'             pass inputs as a JSON object
+  --inputs-file <path>          read inputs from a JSON file
+  --input KEY=VALUE             repeatable; build the inputs object piece by piece
+                                (use --outputs / --output / --outputs-file for submit)
+
+${C_BOLD}EXAMPLES${C_RESET}
+  opensop config set url https://demo.opensop.ai
+  opensop config set token demo-public-token-resets-daily
+  opensop list
+  opensop schema lead-qualification
+  opensop run lead-qualification \\
+    --input lead_name="Ana García" \\
+    --input lead_email=ana@example.com \\
+    --input source=website
+  opensop status <instance-id>
+  opensop steps <instance-id>
+
+${C_BOLD}ENVIRONMENT${C_RESET}
+  OPENSOP_URL                   override config server URL for one call
+  OPENSOP_TOKEN                 override config token for one call
+  OPENSOP_HOME                  config + cache dir (default: ~/.opensop)
+  NO_COLOR                      disable ANSI color output
+EOF
+}
+
+cmd_version() {
+  echo "opensop $OPENSOP_CLI_VERSION"
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: config
+# --------------------------------------------------------------------------- #
+
+cmd_config() {
+  if [[ $# -eq 0 ]]; then
+    load_config
+    if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+      printf '%sserver:%s %s\n' "$C_BOLD" "$C_RESET" "${OPENSOP_URL:-${C_DIM}(unset)$C_RESET}"
+      local masked="${OPENSOP_TOKEN:-}"
+      [[ -n "$masked" ]] && masked="${masked:0:6}…${masked: -4}"
+      printf '%stoken:%s  %s\n' "$C_BOLD" "$C_RESET" "${masked:-${C_DIM}(unset)$C_RESET}"
+      printf '%sconfig:%s %s\n' "$C_BOLD" "$C_RESET" "$CONFIG_FILE"
+    else
+      jq -nc --arg url "${OPENSOP_URL:-}" --arg token "${OPENSOP_TOKEN:-}" --arg cfg "$CONFIG_FILE" \
+        '{url: $url, token_set: ($token | length > 0), config: $cfg}'
+    fi
+    return 0
+  fi
+
+  local sub="$1"; shift
+  case "$sub" in
+    set)
+      [[ $# -lt 2 ]] && die "config set <url|token> <value>"
+      local key="$1" val="$2"
+      load_config
+      case "$key" in
+        url)   OPENSOP_URL="$val" ;;
+        token) OPENSOP_TOKEN="$val" ;;
+        *) die "unknown config key '$key'. valid: url, token" ;;
+      esac
+      save_config
+      ok "$key set"
+      ;;
+    *)
+      die "unknown subcommand 'config $sub'. valid: set"
+      ;;
+  esac
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: list
+# --------------------------------------------------------------------------- #
+
+cmd_list() {
+  local resp; resp=$(api_get "/sop/")
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    echo "$resp" | jq -r '.processes[] | "\(.name)\t\(.version)\t\(.description // "")"' | \
+      while IFS=$'\t' read -r name version desc; do
+        printf '%s%-30s%s %s%s%s  %s\n' "$C_BOLD" "$name" "$C_RESET" "$C_DIM" "v$version" "$C_RESET" "$desc"
+      done
+  else
+    echo "$resp" | emit_pretty_or_json
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: schema
+# --------------------------------------------------------------------------- #
+
+cmd_schema() {
+  [[ $# -lt 1 ]] && die "usage: opensop schema <name>"
+  local name="$1"
+  api_get "/sop/$name/schema" | emit_pretty_or_json
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: run
+# --------------------------------------------------------------------------- #
+
+# Build a JSON object from --input KEY=VALUE pairs, --inputs '<json>', or --inputs-file.
+# Echoes the resulting JSON to stdout.
+build_payload_object() {
+  # Args:
+  #   $1: noun ("input" or "output")
+  #   shift; rest = the user's args after subcommand+positionals already consumed
+  local noun="$1"; shift
+  local plural="${noun}s"
+  local json_blob=""
+  local file_path=""
+  local -a kv_pairs=()
+  local -a metadata_pairs=()
+  local extra_decided_by="" extra_confidence=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --$plural)         json_blob="$2"; shift 2 ;;
+      --$plural-file)    file_path="$2"; shift 2 ;;
+      --$noun)           kv_pairs+=("$2"); shift 2 ;;
+      --metadata)        metadata_pairs+=("$2"); shift 2 ;;
+      --decided-by)      extra_decided_by="$2"; shift 2 ;;
+      --confidence)      extra_confidence="$2"; shift 2 ;;
+      *)                 die "unknown flag: $1" ;;
+    esac
+  done
+
+  local payload="{}"
+
+  # Start from --inputs/--outputs JSON or --inputs-file/--outputs-file.
+  if [[ -n "$json_blob" ]]; then
+    payload=$(echo "$json_blob" | jq .) || die "invalid JSON in --$plural"
+  elif [[ -n "$file_path" ]]; then
+    payload=$(jq . "$file_path") || die "could not read $file_path as JSON"
+  fi
+
+  # Merge --input KEY=VALUE pairs into payload.
+  if (( ${#kv_pairs[@]} > 0 )); then
+    for kv in "${kv_pairs[@]}"; do
+      [[ "$kv" != *=* ]] && die "--$noun expects KEY=VALUE, got: $kv"
+      local k="${kv%%=*}" v="${kv#*=}"
+      # If value parses as JSON (number, bool, null, object, array), use raw; else string.
+      if echo "$v" | jq -e . >/dev/null 2>&1; then
+        payload=$(echo "$payload" | jq --arg k "$k" --argjson v "$v" '.[$k] = $v')
+      else
+        payload=$(echo "$payload" | jq --arg k "$k" --arg v "$v" '.[$k] = $v')
+      fi
+    done
+  fi
+
+  # Build metadata object (run only).
+  local metadata="{}"
+  if (( ${#metadata_pairs[@]} > 0 )); then
+    for kv in "${metadata_pairs[@]}"; do
+      [[ "$kv" != *=* ]] && die "--metadata expects KEY=VALUE, got: $kv"
+      local k="${kv%%=*}" v="${kv#*=}"
+      if echo "$v" | jq -e . >/dev/null 2>&1; then
+        metadata=$(echo "$metadata" | jq --arg k "$k" --argjson v "$v" '.[$k] = $v')
+      else
+        metadata=$(echo "$metadata" | jq --arg k "$k" --arg v "$v" '.[$k] = $v')
+      fi
+    done
+  fi
+
+  # Emit structured response: payload + metadata + extras.
+  jq -nc \
+    --argjson payload "$payload" \
+    --argjson metadata "$metadata" \
+    --arg decided_by "$extra_decided_by" \
+    --arg confidence "$extra_confidence" \
+    '{payload: $payload, metadata: $metadata, decided_by: $decided_by, confidence: $confidence}'
+}
+
+cmd_run() {
+  [[ $# -lt 1 ]] && die "usage: opensop run <name> [--inputs '<json>' | --input KEY=VALUE ...] [--metadata KEY=VALUE ...]"
+  local name="$1"; shift
+
+  local built; built=$(build_payload_object input "$@")
+  local inputs metadata
+  inputs=$(echo "$built" | jq -c '.payload')
+  metadata=$(echo "$built" | jq -c '.metadata')
+
+  local body
+  body=$(jq -nc --argjson inputs "$inputs" --argjson metadata "$metadata" \
+    '{inputs: $inputs, metadata: $metadata}')
+
+  local resp; resp=$(api_post "/sop/$name/start" "$body")
+  local id state
+  id=$(echo "$resp" | jq -r '.id')
+  state=$(echo "$resp" | jq -r '.state')
+  cache_instance "$id" "$name"
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    ok "started $C_BOLD$name$C_RESET"
+    info "  id:    $id"
+    info "  state: $state"
+    # Show what's waiting, if anything.
+    local waiting
+    waiting=$(echo "$resp" | jq -r '.steps[]? | select(.state == "active") | "  \(.step_id) (\(.type)): \(.sub_state // "active")"')
+    [[ -n "$waiting" ]] && { echo; printf '%swaiting:%s\n' "$C_BOLD" "$C_RESET"; echo "$waiting"; }
+    echo
+    info "next:  opensop status $id"
+  else
+    echo "$resp" | emit_pretty_or_json
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: status / steps / cancel
+# --------------------------------------------------------------------------- #
+
+cmd_status() {
+  [[ $# -lt 1 ]] && die "usage: opensop status <instance-id>"
+  local id="$1"
+  local name; name=$(lookup_name "$id")
+  local resp; resp=$(api_get "/sop/$name/$id")
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local state ended
+    state=$(echo "$resp" | jq -r '.state')
+    ended=$(echo "$resp" | jq -r '.completed_at // ""')
+    local color="$C_BLUE"
+    [[ "$state" == "completed" ]] && color="$C_GREEN"
+    [[ "$state" == "failed"    ]] && color="$C_RED"
+    [[ "$state" == "cancelled" ]] && color="$C_YELLOW"
+    printf '%sinstance:%s %s\n' "$C_BOLD" "$C_RESET" "$id"
+    printf '%sprocess:%s  %s\n' "$C_BOLD" "$C_RESET" "$name"
+    printf '%sstate:%s    %s%s%s%s\n' "$C_BOLD" "$C_RESET" "$color" "$state" "$C_RESET" "${ended:+ ($ended)}"
+    echo
+    echo "$resp" | jq -r '.steps[]? | "\(.step_id)\t\(.type)\t\(.state)\t\(.sub_state // "")"' | \
+      while IFS=$'\t' read -r step_id stype sstate sub; do
+        local glyph
+        case "$sstate" in
+          completed) glyph="${C_GREEN}✓${C_RESET}" ;;
+          failed)    glyph="${C_RED}✗${C_RESET}" ;;
+          active)    glyph="${C_YELLOW}⏳${C_RESET}" ;;
+          skipped)   glyph="${C_DIM}—${C_RESET}" ;;
+          *)         glyph="${C_DIM}·${C_RESET}" ;;
+        esac
+        printf '  %s %-30s %s%s%s%s\n' "$glyph" "$step_id" "$C_DIM" "$stype" "${sub:+ · $sub}" "$C_RESET"
+      done
+  else
+    echo "$resp" | emit_pretty_or_json
+  fi
+}
+
+cmd_steps() {
+  [[ $# -lt 1 ]] && die "usage: opensop steps <instance-id>"
+  local id="$1"
+  local name; name=$(lookup_name "$id")
+  api_get "/sop/$name/$id/steps" | emit_pretty_or_json
+}
+
+cmd_cancel() {
+  [[ $# -lt 1 ]] && die "usage: opensop cancel <instance-id> [--reason TEXT]"
+  local id="$1"; shift
+  local reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason) reason="$2"; shift 2 ;;
+      *) die "unknown flag for cancel: $1" ;;
+    esac
+  done
+  local name; name=$(lookup_name "$id")
+  local body
+  body=$(jq -nc --arg reason "$reason" '{reason: $reason}')
+  local resp; resp=$(api_post "/sop/$name/$id/cancel" "$body")
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    ok "cancelled $name $id"
+    [[ -n "$reason" ]] && info "  reason: $reason"
+  else
+    echo "$resp" | emit_pretty_or_json
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: submit
+# --------------------------------------------------------------------------- #
+
+cmd_submit() {
+  [[ $# -lt 2 ]] && die "usage: opensop submit <instance-id> <step-id> [--outputs '<json>' | --output KEY=VALUE ...] [--decided-by WHO] [--confidence N]"
+  local id="$1" step_id="$2"; shift 2
+
+  local built; built=$(build_payload_object output "$@")
+  local outputs decided_by confidence
+  outputs=$(echo "$built" | jq -c '.payload')
+  decided_by=$(echo "$built" | jq -r '.decided_by')
+  confidence=$(echo "$built" | jq -r '.confidence')
+
+  local body
+  body=$(jq -nc --argjson outputs "$outputs" \
+    --arg decided_by "$decided_by" \
+    --arg confidence "$confidence" \
+    '{outputs: $outputs}
+     | (if $decided_by != "" then .decided_by = $decided_by else . end)
+     | (if $confidence != "" then .confidence = ($confidence | tonumber) else . end)')
+
+  local name; name=$(lookup_name "$id")
+  local resp; resp=$(api_post "/sop/$name/$id/steps/$step_id/submit" "$body")
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local instance_state step_state
+    instance_state=$(echo "$resp" | jq -r '.instance.state')
+    step_state=$(echo "$resp" | jq -r '.step.state')
+    ok "submitted $step_id ($step_state) — instance $instance_state"
+    info "next:  opensop status $id"
+  else
+    echo "$resp" | emit_pretty_or_json
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Subcommand: instances
+# --------------------------------------------------------------------------- #
+
+cmd_instances() {
+  local query=""
+  local state="" process="" limit=50 offset=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state)    state="$2";   shift 2 ;;
+      --process)  process="$2"; shift 2 ;;
+      --limit)    limit="$2";   shift 2 ;;
+      --offset)   offset="$2";  shift 2 ;;
+      *) die "unknown flag for instances: $1" ;;
+    esac
+  done
+  query="?limit=$limit&offset=$offset"
+  [[ -n "$state" ]]   && query="$query&state=$state"
+  [[ -n "$process" ]] && query="$query&process=$process"
+
+  local resp; resp=$(api_get "/sop/instances$query")
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local total
+    total=$(echo "$resp" | jq -r '.total')
+    info "$total instance(s)"
+    echo "$resp" | jq -r '.instances[]? | "\(.id)\t\(.process.name)\t\(.state)\t\(.started_at // "")"' | \
+      while IFS=$'\t' read -r id name pstate started; do
+        local color="$C_BLUE"
+        [[ "$pstate" == "completed" ]] && color="$C_GREEN"
+        [[ "$pstate" == "failed"    ]] && color="$C_RED"
+        [[ "$pstate" == "cancelled" ]] && color="$C_YELLOW"
+        printf '  %s  %-25s %s%-10s%s %s\n' "$id" "$name" "$color" "$pstate" "$C_RESET" "$C_DIM$started$C_RESET"
+        # Cache opportunistically — agent may want status next.
+        cache_instance "$id" "$name"
+      done
+  else
+    echo "$resp" | emit_pretty_or_json
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Main dispatch
+# --------------------------------------------------------------------------- #
+
+main() {
+  require_curl
+  require_jq
+
+  # Strip global flags (--json / --pretty / --help / --version) anywhere.
+  local -a args=()
+  for a in "$@"; do
+    case "$a" in
+      --json)              OUTPUT_MODE="json" ;;
+      --pretty)            OUTPUT_MODE="pretty" ;;
+      --help|-h|help)      cmd_help; exit 0 ;;
+      --version|-v|version) cmd_version; exit 0 ;;
+      *) args+=("$a") ;;
+    esac
+  done
+
+  if (( ${#args[@]} == 0 )); then
+    cmd_help; exit 0
+  fi
+  set -- "${args[@]}"
+
+  local cmd="$1"; shift
+  load_config
+
+  case "$cmd" in
+    list)       cmd_list "$@" ;;
+    schema)     cmd_schema "$@" ;;
+    run)        cmd_run "$@" ;;
+    status)     cmd_status "$@" ;;
+    steps)      cmd_steps "$@" ;;
+    submit)     cmd_submit "$@" ;;
+    cancel)     cmd_cancel "$@" ;;
+    instances)  cmd_instances "$@" ;;
+    config)     cmd_config "$@" ;;
+    *)          die "unknown command '$cmd'. run 'opensop help' for usage." ;;
+  esac
+}
+
+main "$@"
