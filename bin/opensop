@@ -16,7 +16,7 @@ set -euo pipefail
 # Constants & paths
 # --------------------------------------------------------------------------- #
 
-readonly OPENSOP_CLI_VERSION="0.3.0"
+readonly OPENSOP_CLI_VERSION="0.3.1"
 readonly OPENSOP_HOME="${OPENSOP_HOME:-$HOME/.opensop}"
 readonly CONFIG_FILE="$OPENSOP_HOME/config"
 readonly CACHE_FILE="$OPENSOP_HOME/instances.tsv"
@@ -875,17 +875,20 @@ cmd_compass() {
   stats=$(echo "$all_instances" | jq -c '
     group_by(.process.name) |
     map(
+      . as $grp |
+      ($grp | map(select(.state == "failed" or .state == "cancelled")) | length) as $failures |
+      ($grp | length) as $total |
       {
-        name:         .[0].process.name,
-        total:        length,
-        latest:       (map(.started_at) | sort | last),
-        failure_count:(map(select(.state == "failed" or .state == "cancelled")) | length),
-        failure_rate: ((map(select(.state == "failed" or .state == "cancelled")) | length) / length)
+        name:         $grp[0].process.name,
+        total:        $total,
+        last_run_at:  ($grp | map(.started_at) | sort | last),
+        failures:     $failures,
+        rate:         ($failures / $total)
       }
     ) | {
-      by_runs:         (sort_by(-.total)         | .[0:10]),
-      by_recency:      (sort_by(.latest)  | reverse | .[0:10]),
-      by_failure_rate: (sort_by(-.failure_rate)  | .[0:10])
+      by_runs:         (sort_by(-.total)        | .[0:10] | map({name, total})),
+      by_recency:      (sort_by(.last_run_at) | reverse | .[0:10] | map({name, last_run_at})),
+      by_failure_rate: (sort_by(-.rate)         | .[0:10] | map({name, total, failures, rate}))
     }
   ')
 
@@ -899,10 +902,10 @@ cmd_compass() {
     echo "$by_runs" | jq -r '.[] | "  \(.name) × \(.total)"'
 
     printf '\n%sMost-recent:%s\n' "$C_BOLD" "$C_RESET"
-    echo "$by_recency" | jq -r '.[] | "  \(.name)  \(.latest // "-")"'
+    echo "$by_recency" | jq -r '.[] | "  \(.name)  \(.last_run_at // "-")"'
 
     printf '\n%sHighest failure rate:%s\n' "$C_BOLD" "$C_RESET"
-    echo "$by_failure" | jq -r '.[] | "  \(.name)  \(.failure_rate * 100 | round | tostring)%  (\(.failure_count)/\(.total))"'
+    echo "$by_failure" | jq -r '.[] | "  \(.name)  \(.rate * 100 | round | tostring)%  (\(.failures)/\(.total))"'
   else
     echo "$stats" | emit_pretty_or_json
   fi
