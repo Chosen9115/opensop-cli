@@ -16,7 +16,7 @@ set -euo pipefail
 # Constants & paths
 # --------------------------------------------------------------------------- #
 
-readonly OPENSOP_CLI_VERSION="0.4.0"
+readonly OPENSOP_CLI_VERSION="0.4.1"
 readonly OPENSOP_HOME="${OPENSOP_HOME:-$HOME/.opensop}"
 readonly CONFIG_FILE="$OPENSOP_HOME/config"
 readonly CACHE_FILE="$OPENSOP_HOME/instances.tsv"
@@ -228,23 +228,30 @@ cache_instance() {
 }
 
 lookup_name() {
-  # Resolve instance id → process name. Cache first, then /sop/instances scan.
+  # Resolve instance id → process name. Cache first, then paginated /sop/instances scan.
   local id="$1"
   if [[ -f "$CACHE_FILE" ]]; then
     local hit
     hit=$(awk -F'\t' -v id="$id" '$1 == id { print $2; exit }' "$CACHE_FILE")
     [[ -n "$hit" ]] && { echo "$hit"; return 0; }
   fi
-  # Cache miss — fetch all instances and grep.
+  # Cache miss — paginate up to 1000 rows (5 pages of 200) looking for the id.
   warn "id $id not in local cache; scanning /sop/instances..."
-  local resp name
-  resp=$(api_get "/sop/instances?limit=200")
-  name=$(echo "$resp" | jq -r --arg id "$id" '.instances[] | select(.id == $id) | .process.name' | head -1)
-  if [[ -z "$name" ]]; then
-    die "instance $id not found on $OPENSOP_URL (check the id, or set --state and re-list with 'opensop instances')" "instance_not_found"
-  fi
-  cache_instance "$id" "$name"
-  echo "$name"
+  local name=""
+  for offset in 0 200 400 600 800; do
+    local resp count
+    resp=$(api_get "/sop/instances?limit=200&offset=$offset")
+    name=$(echo "$resp" | jq -r --arg id "$id" '.instances[] | select(.id == $id) | .process.name' | head -1)
+    if [[ -n "$name" ]]; then
+      cache_instance "$id" "$name"
+      echo "$name"
+      return 0
+    fi
+    count=$(echo "$resp" | jq -r '.instances | length')
+    # Short page = end of results; no need to keep paging.
+    [[ "$count" -lt 200 ]] && break
+  done
+  die "instance $id not found on $OPENSOP_URL (check the id, or set --state and re-list with 'opensop instances')" "instance_not_found"
 }
 
 # --------------------------------------------------------------------------- #
@@ -651,6 +658,12 @@ cmd_instances() {
 
   local resp; resp=$(api_get "/sop/instances$query")
 
+  # Always prime the local cache from every returned row so that
+  # a subsequent `opensop status <id>` doesn't hit the cache-miss path.
+  while IFS=$'\t' read -r _cid _cname; do
+    [[ -n "$_cid" && -n "$_cname" ]] && cache_instance "$_cid" "$_cname"
+  done < <(echo "$resp" | jq -r '.instances[]? | "\(.id)\t\(.process.name)"')
+
   if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
     local total
     total=$(echo "$resp" | jq -r '.total')
@@ -662,8 +675,6 @@ cmd_instances() {
         [[ "$pstate" == "failed"    ]] && color="$C_RED"
         [[ "$pstate" == "cancelled" ]] && color="$C_YELLOW"
         printf '  %s  %-25s %s%-10s%s %s\n' "$id" "$name" "$color" "$pstate" "$C_RESET" "$C_DIM$started$C_RESET"
-        # Cache opportunistically — agent may want status next.
-        cache_instance "$id" "$name"
       done
   else
     echo "$resp" | emit_pretty_or_json
@@ -675,9 +686,11 @@ cmd_instances() {
 # --------------------------------------------------------------------------- #
 
 # score_processes KEYWORDS_JSON PROCESSES_JSON
-#   Scores each process by counting case-insensitive keyword matches across
-#   name + description + tags. Emits JSON array sorted by score desc.
-#   KEYWORDS_JSON: a JSON array of strings.
+#   Scores each process by counting case-insensitive token matches across
+#   name (hyphen/underscore-tokenized) + description + tags + inputs_summary +
+#   outputs_summary. Emits JSON array sorted by score desc.
+#   KEYWORDS_JSON: a JSON array of strings (each may itself be multi-word;
+#   they are tokenized again on whitespace inside jq).
 #   PROCESSES_JSON: the full /sop/ response object.
 score_processes() {
   local keywords_json="$1"
@@ -685,21 +698,33 @@ score_processes() {
 
   echo "$processes_json" | jq -c \
     --argjson kws "$keywords_json" '
+    # Flatten a possibly-multi-word keyword array into individual tokens,
+    # dropping tokens shorter than 2 characters (stop words).
+    ($kws | map(ascii_downcase | split(" ") | .[] | select(length >= 2)) ) as $tokens |
+
     [ .processes[] |
       . as $p |
-      # Concatenate searchable text: name + description + tags joined.
-      (($p.name // "") + " " +
+      # Build haystack:
+      #   - name with hyphens/underscores replaced by spaces (tokenizes names)
+      #   - description
+      #   - tags joined
+      #   - inputs_summary (new in v0.4.1)
+      #   - outputs_summary (new in v0.4.1)
+      (($p.name // "" | gsub("[-_]"; " ")) + " " +
+       ($p.name // "") + " " +
        ($p.description // "") + " " +
-       (($p.tags // []) | join(" "))) | ascii_downcase as $text |
-      # Sum word-boundary matches; skip single-char keywords (stop words like "a", "I").
-      ($kws | map(
-        . | ascii_downcase as $kw |
-        if ($kw | length) < 2 then 0
+       (($p.tags // []) | join(" ")) + " " +
+       ($p.inputs_summary // "") + " " +
+       ($p.outputs_summary // "")) | ascii_downcase as $text |
+      # Sum word-boundary matches per token; skip tokens shorter than 2 chars.
+      ($tokens | map(
+        . as $tok |
+        if ($tok | length) < 2 then 0
         else
-          ("\\b" + $kw + "\\b") as $pat |
+          ("\\b" + $tok + "\\b") as $pat |
           ($text | [scan($pat)] | length)
         end
-      ) | add) as $score |
+      ) | add // 0) as $score |
       select($score >= 1) |
       {name: $p.name, score: $score, description: ($p.description // ""), tags: ($p.tags // [])}
     ] | sort_by(-.score)

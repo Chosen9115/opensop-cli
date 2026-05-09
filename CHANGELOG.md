@@ -7,6 +7,33 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ---
 
+## [0.4.1] — 2026-05-08
+
+### Fixed
+
+- **Cache priming on `history` and `instances`** — both subcommands now
+  populate the local `id → process.name` map from every response row.
+  Agents who use the discovery layer to find an instance and immediately
+  inspect it no longer hit the cache-miss path.
+- **Paginated cache-miss fallback in `lookup_name`** — the fallback now
+  walks up to 1000 instances (5 pages of 200) before giving up, instead
+  of stopping at the first 200. Defensive fix; rarely hit once cache
+  priming is in.
+- **Multi-word `search` and `suggest`** — queries are now tokenized on
+  whitespace and scored per-token, with hyphenated process names also
+  tokenized on `-`/`_`. `search "morning briefing"` now correctly
+  matches `darwin-morning-briefing`. Single-word queries unchanged.
+
+### Changed
+
+- **Search/suggest corpus widened** — `inputs_summary` and
+  `outputs_summary` (already in the `/sop/` discovery response, just
+  unused) are now indexed alongside name + description + tags.
+  Expected ~30% recall lift on "what produces X?" / "I want Y"
+  intent queries. Reported by the Darwin agent.
+
+---
+
 ## [0.4.0] — 2026-05-08
 
 ### Added
@@ -98,6 +125,7 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 - `X-SOP-Token` auth header support.
 - `NO_COLOR` support.
 
+[0.4.1]: https://github.com/Chosen9115/opensop-cli/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Chosen9115/opensop-cli/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.2.0...v0.3.0
