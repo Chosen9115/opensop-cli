@@ -1,0 +1,105 @@
+# Changelog
+
+All notable changes to opensop-cli are documented here.
+
+This project follows [Semantic Versioning](https://semver.org/) and the
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
+
+---
+
+## [0.4.0] — 2026-05-08
+
+### Added
+
+- **Structured CLI-side errors in `--json` mode.** When `--json` is set, every
+  `die()`/`err()` call now emits `{"error": "<code>", "message": "<message>",
+  "hint": "<hint>"}` to stderr instead of prose. Prose-mode default (TTY) is
+  unchanged — fully backward-compatible.
+- `_resolve_output_mode()` helper that respects `OUTPUT_MODE` before `main()`
+  has finished stripping flags (e.g. very early dependency checks).
+- Error codes for all CLI-side failure paths: `config_missing`,
+  `missing_dependency`, `network_error`, `instance_not_found`, `usage_error`,
+  `file_not_found`, `invalid_json`, `unknown_command`, `unknown_flag`,
+  `parse_error`, `cli_error`.
+- `hint` field on relevant codes (e.g. `config_missing` hints
+  `opensop config set url <URL>`; `missing_dependency` for jq hints
+  `brew install jq`).
+
+### Changed
+
+- **HTTP error path in `api_call`:** in `--json` mode, server error envelopes
+  now pass through verbatim with a `_meta.http_status` field appended. The
+  previous behavior (prose + raw JSON dump) is replaced by a single clean JSON
+  object on stderr.
+- `register` HTTP error path brought in line with the same `api_call` pattern.
+- All `die "..."` call sites updated with explicit codes and hints where
+  applicable.
+- `file not found` wording normalised to `"file does not exist: <path>"` across
+  `register` and `schema validate`.
+
+---
+
+## [0.3.1] — 2026-05-08
+
+### Fixed
+
+- `compass --json` shape now matches docs: top-level keys are
+  `{by_runs, by_recency, by_failure_rate}` with consistent field names per
+  slice (`{name, total}` / `{name, last_run_at}` /
+  `{name, total, failures, rate}`).
+
+---
+
+## [0.3.0] — 2026-05-08
+
+### Added
+
+- `diff <id1> <id2>` — compare two instances of the same process field-by-field.
+- `compass` — top processes by run-count, recency, and failure rate.
+- `history --process <name> [--limit N]` — recent instances of a specific
+  process, newest-first.
+- `dry-run <name> [opts]` — client-side preview: validates inputs against the
+  process schema and describes each step without creating an instance.
+- `register <process.yaml>` — POST a `.sop.yaml` to `/sop/processes/register`.
+- `schema validate <file.yaml>` — fully client-side YAML lint using `yq` (v4+)
+  with `python3` + PyYAML as a fallback.
+- `--local` global flag — overrides `OPENSOP_URL` to `http://localhost:3000`
+  for a single call without changing config.
+
+---
+
+## [0.2.0] — 2026-05-08
+
+### Added
+
+- `search <keyword> [...]` — ranked text search over process names,
+  descriptions, and tags.
+- `suggest "<task description>"` — inverse retrieval: describe a task, get the
+  top-matching process back with a confidence score.
+- `list --tag <tag>` — client-side filter by tag.
+- README worked example (full `lead-qualification` run from start to
+  completion).
+- Sample `opensop list` output in README.
+- Lifted the cache-line note into its own README section.
+
+---
+
+## [0.1.0] — 2026-05-07
+
+### Added
+
+- Initial release.
+- 9 subcommands: `list`, `schema`, `run`, `status`, `steps`, `submit`,
+  `cancel`, `instances`, `config`.
+- Instance-ID local cache (`~/.opensop/instances.tsv`) — maps instance IDs to
+  process names so subsequent commands need only the ID.
+- TTY-aware output: pretty-printed in a terminal, compact JSON when piped.
+- `--json` / `--pretty` global flags.
+- `X-SOP-Token` auth header support.
+- `NO_COLOR` support.
+
+[0.4.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/Chosen9115/opensop-cli/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Chosen9115/opensop-cli/releases/tag/v0.1.0

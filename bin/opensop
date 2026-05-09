@@ -16,7 +16,7 @@ set -euo pipefail
 # Constants & paths
 # --------------------------------------------------------------------------- #
 
-readonly OPENSOP_CLI_VERSION="0.3.1"
+readonly OPENSOP_CLI_VERSION="0.4.0"
 readonly OPENSOP_HOME="${OPENSOP_HOME:-$HOME/.opensop}"
 readonly CONFIG_FILE="$OPENSOP_HOME/config"
 readonly CACHE_FILE="$OPENSOP_HOME/instances.tsv"
@@ -42,12 +42,50 @@ else
   C_YELLOW=""; C_BLUE=""; C_CYAN=""
 fi
 
-err()  { printf '%sopensop:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+# _resolve_output_mode
+#   Returns the effective output mode: "json" or "pretty".
+#   --json flag sets OUTPUT_MODE="json"; --pretty sets "pretty".
+#   "auto" (default before main strips flags) resolves TTY-aware.
+_resolve_output_mode() {
+  local mode="$OUTPUT_MODE"
+  if [[ "$mode" == "auto" ]]; then
+    is_tty && mode="pretty" || mode="json"
+  fi
+  echo "$mode"
+}
+
+# _error_mode
+#   Returns "json" only when --json was explicitly requested (OUTPUT_MODE="json").
+#   "auto" always resolves to prose for error messages — errors are human-readable
+#   by default; agents opt in with --json.
+_error_mode() {
+  if [[ "$OUTPUT_MODE" == "json" ]]; then
+    echo "json"
+  else
+    echo "prose"
+  fi
+}
+
+# err MESSAGE [CODE [HINT]]
+#   Print an error. In JSON mode emits {error, message, hint?} to stderr.
+#   In prose mode prints the familiar colored "opensop: ..." line.
+err() {
+  local message="$1" code="${2:-cli_error}" hint="${3:-}"
+  local mode; mode=$(_error_mode)
+  if [[ "$mode" == "json" ]]; then
+    jq -nc --arg error "$code" --arg msg "$message" --arg hint "$hint" \
+      '{error: $error, message: $msg} + (if $hint != "" then {hint: $hint} else {} end)' >&2
+  else
+    printf '%sopensop:%s %s\n' "$C_RED" "$C_RESET" "$message" >&2
+  fi
+}
+
 warn() { printf '%sopensop:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 info() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
 
-die() { err "$*"; exit 1; }
+# die MESSAGE [CODE [HINT]]
+die() { err "$@"; exit 1; }
 
 # Output mode: pretty | json. Set by --json / --pretty flags or auto-detected.
 OUTPUT_MODE="auto"
@@ -59,8 +97,7 @@ emit_json() {
 
 emit_pretty_or_json() {
   # If TTY and not --json, pretty-print. Else compact JSON.
-  local mode="$OUTPUT_MODE"
-  [[ "$mode" == "auto" ]] && { is_tty && mode="pretty" || mode="json"; }
+  local mode; mode=$(_resolve_output_mode)
   if [[ "$mode" == "json" ]]; then
     jq -c .
   else
@@ -73,11 +110,11 @@ emit_pretty_or_json() {
 # --------------------------------------------------------------------------- #
 
 require_jq() {
-  command -v jq >/dev/null 2>&1 || die "jq is required. Install: brew install jq | apt install jq"
+  command -v jq >/dev/null 2>&1 || die "jq is required — install it first" "missing_dependency" "brew install jq"
 }
 
 require_curl() {
-  command -v curl >/dev/null 2>&1 || die "curl is required (it should be on every Unix already)."
+  command -v curl >/dev/null 2>&1 || die "curl is required (it should be on every Unix already)" "missing_dependency"
 }
 
 # --------------------------------------------------------------------------- #
@@ -114,7 +151,7 @@ EOF
 }
 
 require_url() {
-  [[ -n "${OPENSOP_URL:-}" ]] || die "OPENSOP_URL is not set. Run: opensop config set url <https://your-server>"
+  [[ -n "${OPENSOP_URL:-}" ]] || die "OPENSOP_URL is not set — run: opensop config set url <https://your-server>" "config_missing" "opensop config set url <URL>"
 }
 
 # --------------------------------------------------------------------------- #
@@ -147,15 +184,24 @@ api_call() {
   local status
   if ! status=$(curl "${curl_args[@]}" "$url"); then
     rm -f "$tmp_body"
-    die "request failed: $method $url"
+    die "request failed: $method $url" "network_error"
   fi
 
   if [[ "$status" -ge 400 ]]; then
-    local err_msg err_code
-    err_code=$(jq -r '.error // "http_error"' "$tmp_body" 2>/dev/null || echo "http_error")
-    err_msg=$(jq -r '.message // empty' "$tmp_body" 2>/dev/null || echo "")
-    err "HTTP $status — $err_code${err_msg:+: $err_msg}"
-    [[ "$OUTPUT_MODE" == "json" ]] && cat "$tmp_body" >&2
+    local emode; emode=$(_error_mode)
+    if [[ "$emode" == "json" ]]; then
+      # In JSON mode: pass through the server's error envelope verbatim,
+      # augmented with _meta.http_status for round-trip context.
+      jq -c --argjson s "$status" '. + {_meta: {http_status: $s}}' "$tmp_body" >&2 \
+        2>/dev/null || jq -nc --argjson s "$status" \
+          '{error: "http_error", message: "HTTP error", _meta: {http_status: $s}}' >&2
+    else
+      local err_msg err_code
+      err_code=$(jq -r '.error // "http_error"' "$tmp_body" 2>/dev/null || echo "http_error")
+      err_msg=$(jq -r '.message // empty' "$tmp_body" 2>/dev/null || echo "")
+      printf '%sopensop:%s HTTP %s — %s%s\n' "$C_RED" "$C_RESET" "$status" "$err_code" \
+        "${err_msg:+: $err_msg}" >&2
+    fi
     rm -f "$tmp_body"
     exit 1
   fi
@@ -195,7 +241,7 @@ lookup_name() {
   resp=$(api_get "/sop/instances?limit=200")
   name=$(echo "$resp" | jq -r --arg id "$id" '.instances[] | select(.id == $id) | .process.name' | head -1)
   if [[ -z "$name" ]]; then
-    die "instance $id not found on $OPENSOP_URL (check the id, or set --state and re-list with 'opensop instances')"
+    die "instance $id not found on $OPENSOP_URL (check the id, or set --state and re-list with 'opensop instances')" "instance_not_found"
   fi
   cache_instance "$id" "$name"
   echo "$name"
@@ -310,19 +356,19 @@ cmd_config() {
   local sub="$1"; shift
   case "$sub" in
     set)
-      [[ $# -lt 2 ]] && die "config set <url|token> <value>"
+      [[ $# -lt 2 ]] && die "usage: opensop config set <url|token> <value>" "usage_error" "run opensop help"
       local key="$1" val="$2"
       load_config
       case "$key" in
         url)   OPENSOP_URL="$val" ;;
         token) OPENSOP_TOKEN="$val" ;;
-        *) die "unknown config key '$key'. valid: url, token" ;;
+        *) die "unknown config key '$key' — valid: url, token" "usage_error" "run opensop help" ;;
       esac
       save_config
       ok "$key set"
       ;;
     *)
-      die "unknown subcommand 'config $sub'. valid: set"
+      die "unknown subcommand 'config $sub' — valid: set" "usage_error" "run opensop help"
       ;;
   esac
 }
@@ -336,7 +382,7 @@ cmd_list() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tag) tag_filter="$2"; shift 2 ;;
-      *) die "unknown flag for list: $1" ;;
+      *) die "unknown flag for list: $1" "unknown_flag" "run opensop list --help" ;;
     esac
   done
 
@@ -363,7 +409,7 @@ cmd_list() {
 # --------------------------------------------------------------------------- #
 
 cmd_schema() {
-  [[ $# -lt 1 ]] && die "usage: opensop schema <name>"
+  [[ $# -lt 1 ]] && die "usage: opensop schema <name>" "usage_error" "run opensop help"
   local name="$1"
   api_get "/sop/$name/schema" | emit_pretty_or_json
 }
@@ -394,7 +440,7 @@ build_payload_object() {
       --metadata)        metadata_pairs+=("$2"); shift 2 ;;
       --decided-by)      extra_decided_by="$2"; shift 2 ;;
       --confidence)      extra_confidence="$2"; shift 2 ;;
-      *)                 die "unknown flag: $1" ;;
+      *)                 die "unknown flag: $1" "unknown_flag" "run opensop help" ;;
     esac
   done
 
@@ -402,15 +448,15 @@ build_payload_object() {
 
   # Start from --inputs/--outputs JSON or --inputs-file/--outputs-file.
   if [[ -n "$json_blob" ]]; then
-    payload=$(echo "$json_blob" | jq .) || die "invalid JSON in --$plural"
+    payload=$(echo "$json_blob" | jq .) || die "invalid JSON in --$plural" "invalid_json"
   elif [[ -n "$file_path" ]]; then
-    payload=$(jq . "$file_path") || die "could not read $file_path as JSON"
+    payload=$(jq . "$file_path") || die "could not read $file_path as JSON" "invalid_json"
   fi
 
   # Merge --input KEY=VALUE pairs into payload.
   if (( ${#kv_pairs[@]} > 0 )); then
     for kv in "${kv_pairs[@]}"; do
-      [[ "$kv" != *=* ]] && die "--$noun expects KEY=VALUE, got: $kv"
+      [[ "$kv" != *=* ]] && die "--$noun expects KEY=VALUE, got: $kv" "usage_error"
       local k="${kv%%=*}" v="${kv#*=}"
       # If value parses as JSON (number, bool, null, object, array), use raw; else string.
       if echo "$v" | jq -e . >/dev/null 2>&1; then
@@ -425,7 +471,7 @@ build_payload_object() {
   local metadata="{}"
   if (( ${#metadata_pairs[@]} > 0 )); then
     for kv in "${metadata_pairs[@]}"; do
-      [[ "$kv" != *=* ]] && die "--metadata expects KEY=VALUE, got: $kv"
+      [[ "$kv" != *=* ]] && die "--metadata expects KEY=VALUE, got: $kv" "usage_error"
       local k="${kv%%=*}" v="${kv#*=}"
       if echo "$v" | jq -e . >/dev/null 2>&1; then
         metadata=$(echo "$metadata" | jq --arg k "$k" --argjson v "$v" '.[$k] = $v')
@@ -445,7 +491,7 @@ build_payload_object() {
 }
 
 cmd_run() {
-  [[ $# -lt 1 ]] && die "usage: opensop run <name> [--inputs '<json>' | --input KEY=VALUE ...] [--metadata KEY=VALUE ...]"
+  [[ $# -lt 1 ]] && die "usage: opensop run <name> [--inputs '<json>' | --input KEY=VALUE ...] [--metadata KEY=VALUE ...]" "usage_error" "run opensop help"
   local name="$1"; shift
 
   local built; built=$(build_payload_object input "$@")
@@ -483,7 +529,7 @@ cmd_run() {
 # --------------------------------------------------------------------------- #
 
 cmd_status() {
-  [[ $# -lt 1 ]] && die "usage: opensop status <instance-id>"
+  [[ $# -lt 1 ]] && die "usage: opensop status <instance-id>" "usage_error" "run opensop help"
   local id="$1"
   local name; name=$(lookup_name "$id")
   local resp; resp=$(api_get "/sop/$name/$id")
@@ -518,20 +564,20 @@ cmd_status() {
 }
 
 cmd_steps() {
-  [[ $# -lt 1 ]] && die "usage: opensop steps <instance-id>"
+  [[ $# -lt 1 ]] && die "usage: opensop steps <instance-id>" "usage_error" "run opensop help"
   local id="$1"
   local name; name=$(lookup_name "$id")
   api_get "/sop/$name/$id/steps" | emit_pretty_or_json
 }
 
 cmd_cancel() {
-  [[ $# -lt 1 ]] && die "usage: opensop cancel <instance-id> [--reason TEXT]"
+  [[ $# -lt 1 ]] && die "usage: opensop cancel <instance-id> [--reason TEXT]" "usage_error" "run opensop help"
   local id="$1"; shift
   local reason=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --reason) reason="$2"; shift 2 ;;
-      *) die "unknown flag for cancel: $1" ;;
+      *) die "unknown flag for cancel: $1" "unknown_flag" "run opensop cancel --help" ;;
     esac
   done
   local name; name=$(lookup_name "$id")
@@ -552,7 +598,7 @@ cmd_cancel() {
 # --------------------------------------------------------------------------- #
 
 cmd_submit() {
-  [[ $# -lt 2 ]] && die "usage: opensop submit <instance-id> <step-id> [--outputs '<json>' | --output KEY=VALUE ...] [--decided-by WHO] [--confidence N]"
+  [[ $# -lt 2 ]] && die "usage: opensop submit <instance-id> <step-id> [--outputs '<json>' | --output KEY=VALUE ...] [--decided-by WHO] [--confidence N]" "usage_error" "run opensop help"
   local id="$1" step_id="$2"; shift 2
 
   local built; built=$(build_payload_object output "$@")
@@ -596,7 +642,7 @@ cmd_instances() {
       --process)  process="$2"; shift 2 ;;
       --limit)    limit="$2";   shift 2 ;;
       --offset)   offset="$2";  shift 2 ;;
-      *) die "unknown flag for instances: $1" ;;
+      *) die "unknown flag for instances: $1" "unknown_flag" "run opensop instances --help" ;;
     esac
   done
   query="?limit=$limit&offset=$offset"
@@ -661,7 +707,7 @@ score_processes() {
 }
 
 cmd_search() {
-  [[ $# -lt 1 ]] && die "usage: opensop search <keyword> [keyword2 ...]"
+  [[ $# -lt 1 ]] && die "usage: opensop search <keyword> [keyword2 ...]" "usage_error" "run opensop help"
   local -a keywords=("$@")
   local keywords_json
   keywords_json=$(printf '%s\n' "${keywords[@]}" | jq -Rsc '[split("\n")[] | select(length > 0)]')
@@ -697,7 +743,7 @@ cmd_search() {
 }
 
 cmd_suggest() {
-  [[ $# -lt 1 ]] && die "usage: opensop suggest \"<task description>\""
+  [[ $# -lt 1 ]] && die "usage: opensop suggest \"<task description>\"" "usage_error" "run opensop help"
   # Treat all positional args as one concatenated task string.
   local task="$*"
   local -a keywords
@@ -726,7 +772,7 @@ cmd_suggest() {
     IFS=' ' read -r -a keywords <<< "$task"
   fi
 
-  [[ ${#keywords[@]} -eq 0 ]] && die "usage: opensop suggest \"<task description>\""
+  [[ ${#keywords[@]} -eq 0 ]] && die "usage: opensop suggest \"<task description>\"" "usage_error" "run opensop help"
 
   local keywords_json
   keywords_json=$(printf '%s\n' "${keywords[@]}" | jq -Rsc '[split("\n")[] | select(length > 0)]')
@@ -784,12 +830,12 @@ cmd_suggest() {
 # --------------------------------------------------------------------------- #
 
 cmd_diff() {
-  [[ $# -lt 2 ]] && die "usage: opensop diff <id1> <id2>"
+  [[ $# -lt 2 ]] && die "usage: opensop diff <id1> <id2>" "usage_error" "run opensop help"
   local id1="$1" id2="$2"
 
   local name1; name1=$(lookup_name "$id1")
   local name2; name2=$(lookup_name "$id2")
-  [[ "$name1" != "$name2" ]] && die "instances are from different processes ($name1 vs $name2); diff requires the same process"
+  [[ "$name1" != "$name2" ]] && die "instances are from different processes ($name1 vs $name2); diff requires the same process" "cli_error"
 
   local a; a=$(api_get "/sop/$name1/$id1")
   local b; b=$(api_get "/sop/$name2/$id2")
@@ -921,10 +967,10 @@ cmd_history() {
     case "$1" in
       --process) process="$2"; shift 2 ;;
       --limit)   limit="$2";   shift 2 ;;
-      *) die "unknown flag for history: $1" ;;
+      *) die "unknown flag for history: $1" "unknown_flag" "run opensop history --help" ;;
     esac
   done
-  [[ -z "$process" ]] && die "usage: opensop history --process <name> [--limit N]"
+  [[ -z "$process" ]] && die "usage: opensop history --process <name> [--limit N]" "usage_error" "run opensop help"
   # Delegate to cmd_instances — share backend call, no duplication.
   cmd_instances --process "$process" --limit "$limit"
 }
@@ -973,7 +1019,7 @@ walk_steps_preview() {
 }
 
 cmd_dry_run() {
-  [[ $# -lt 1 ]] && die "usage: opensop dry-run <name> [--inputs '<json>' | --input KEY=VALUE ...] [--inputs-file <path>]"
+  [[ $# -lt 1 ]] && die "usage: opensop dry-run <name> [--inputs '<json>' | --input KEY=VALUE ...] [--inputs-file <path>]" "usage_error" "run opensop help"
   local name="$1"; shift
 
   # Parse flags — only input flags (no metadata/etc for dry-run).
@@ -984,20 +1030,20 @@ cmd_dry_run() {
       --inputs)       json_blob="$2";  shift 2 ;;
       --inputs-file)  file_path="$2";  shift 2 ;;
       --input)        kv_pairs+=("$2"); shift 2 ;;
-      *) die "unknown flag for dry-run: $1" ;;
+      *) die "unknown flag for dry-run: $1" "unknown_flag" "run opensop dry-run --help" ;;
     esac
   done
 
   # Build input object.
   local inputs="{}"
   if [[ -n "$json_blob" ]]; then
-    inputs=$(echo "$json_blob" | jq .) || die "invalid JSON in --inputs"
+    inputs=$(echo "$json_blob" | jq .) || die "invalid JSON in --inputs" "invalid_json"
   elif [[ -n "$file_path" ]]; then
-    inputs=$(jq . "$file_path") || die "could not read $file_path as JSON"
+    inputs=$(jq . "$file_path") || die "could not read $file_path as JSON" "invalid_json"
   fi
   if (( ${#kv_pairs[@]} > 0 )); then
     for kv in "${kv_pairs[@]}"; do
-      [[ "$kv" != *=* ]] && die "--input expects KEY=VALUE, got: $kv"
+      [[ "$kv" != *=* ]] && die "--input expects KEY=VALUE, got: $kv" "usage_error"
       local k="${kv%%=*}" v="${kv#*=}"
       if echo "$v" | jq -e . >/dev/null 2>&1; then
         inputs=$(echo "$inputs" | jq --arg k "$k" --argjson v "$v" '.[$k] = $v')
@@ -1082,9 +1128,9 @@ cmd_dry_run() {
 # --------------------------------------------------------------------------- #
 
 cmd_register() {
-  [[ $# -lt 1 ]] && die "usage: opensop register <process.yaml>"
+  [[ $# -lt 1 ]] && die "usage: opensop register <process.yaml>" "usage_error" "run opensop help"
   local file="$1"
-  [[ ! -f "$file" ]] && die "file not found: $file"
+  [[ ! -f "$file" ]] && die "file does not exist: $file" "file_not_found"
 
   local yaml_content; yaml_content=$(cat "$file")
 
@@ -1125,12 +1171,19 @@ cmd_register() {
     local err_code err_msg
     err_code=$(echo "$resp" | jq -r '.error // "http_error"' 2>/dev/null || echo "http_error")
     err_msg=$(echo "$resp"  | jq -r '.message // empty'      2>/dev/null || echo "")
-    err "HTTP $status — $err_code${err_msg:+: $err_msg}"
-    if [[ "$status" == "401" || "$status" == "403" ]]; then
-      warn "registration may be admin-restricted; check your token has the right scope,"
-      warn "or register via the dashboard at ${OPENSOP_URL}/admin"
+    local emode; emode=$(_error_mode)
+    if [[ "$emode" == "json" ]]; then
+      jq -c --argjson s "$status" '. + {_meta: {http_status: $s}}' <<< "$resp" >&2 \
+        2>/dev/null || jq -nc --argjson s "$status" \
+          '{error: "http_error", message: "HTTP error", _meta: {http_status: $s}}' >&2
+    else
+      printf '%sopensop:%s HTTP %s — %s%s\n' "$C_RED" "$C_RESET" "$status" "$err_code" \
+        "${err_msg:+: $err_msg}" >&2
+      if [[ "$status" == "401" || "$status" == "403" ]]; then
+        warn "registration may be admin-restricted; check your token has the right scope,"
+        warn "or register via the dashboard at ${OPENSOP_URL}/admin"
+      fi
     fi
-    [[ "$OUTPUT_MODE" == "json" ]] && echo "$resp" >&2
     exit 1
   fi
 
@@ -1157,16 +1210,16 @@ resolve_yaml() {
     yq e -o=json '.' "$file"
   elif command -v python3 >/dev/null 2>&1; then
     python3 -c 'import yaml,json,sys; print(json.dumps(yaml.safe_load(open(sys.argv[1]))))' "$file" \
-      || die "python3 YAML parse failed for $file"
+      || die "python3 YAML parse failed for $file" "parse_error"
   else
-    die "schema validate needs 'yq' or 'python3' with PyYAML — install one"
+    die "schema validate needs 'yq' or 'python3' with PyYAML — install one" "missing_dependency"
   fi
 }
 
 cmd_schema_validate() {
-  [[ $# -lt 1 ]] && die "usage: opensop schema validate <file.yaml>"
+  [[ $# -lt 1 ]] && die "usage: opensop schema validate <file.yaml>" "usage_error" "run opensop help"
   local file="$1"
-  [[ ! -f "$file" ]] && die "file not found: $file"
+  [[ ! -f "$file" ]] && die "file does not exist: $file" "file_not_found"
 
   local doc
   doc=$(resolve_yaml "$file") || exit 1
@@ -1327,7 +1380,7 @@ main() {
     register)   cmd_register "$@" ;;
     instances)  cmd_instances "$@" ;;
     config)     cmd_config "$@" ;;
-    *)          die "unknown command '$cmd'. run 'opensop help' for usage." ;;
+    *)          die "unknown command '$cmd' — run 'opensop help' for usage" "unknown_command" "run opensop help" ;;
   esac
 }
 

@@ -195,6 +195,13 @@ opensop list --pretty           # always pretty (well, always indented JSON outs
 opensop status <id> | jq ...    # piping → JSON automatically
 ```
 
+When `--json` is set, **errors also emit JSON to stderr**: server errors round-trip via `{error, message, ...}` from the engine (augmented with `_meta.http_status`); CLI-side errors (config missing, file not found, invalid input, unknown command, etc.) emit `{error, message, hint?}` from the same envelope. Agents can parse stderr the same way they parse stdout.
+
+```bash
+$ opensop --json schema validate /nonexistent.yaml 2>&1 1>/dev/null
+{"error":"file_not_found","message":"file does not exist: /nonexistent.yaml"}
+```
+
 Set `NO_COLOR=1` to disable ANSI color.
 
 ## Input forms
