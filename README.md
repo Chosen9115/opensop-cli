@@ -32,6 +32,77 @@ chmod +x /usr/local/bin/opensop
 - `curl`
 - `jq` — `brew install jq` / `apt install jq`
 
+### Shell completions
+
+The CLI does not generate completion files yet, but you can install static
+completion examples for the common subcommands: `list`, `schema`, `run`,
+`status`, `steps`, `submit`, and `dry-run`.
+
+For bash, save this as `~/.opensop-completion.bash`:
+
+```bash
+_opensop_complete() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local commands="list schema run status steps submit dry-run"
+
+  if [[ "$COMP_CWORD" -eq 1 ]]; then
+    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+  else
+    COMPREPLY=()
+  fi
+}
+
+complete -F _opensop_complete opensop
+```
+
+Then source it from `~/.bashrc`:
+
+```bash
+source ~/.opensop-completion.bash
+```
+
+For zsh, create a completion directory and add it to `fpath` before `compinit`
+runs:
+
+```zsh
+mkdir -p ~/.zsh/completions
+```
+
+Add this file at `~/.zsh/completions/_opensop`:
+
+```zsh
+#compdef opensop
+
+_opensop() {
+  local -a commands
+  commands=(
+    'list:List registered processes'
+    'schema:Show a process schema'
+    'run:Start a process instance'
+    'status:Show instance status'
+    'steps:List instance steps'
+    'submit:Submit outputs for a waiting step'
+    'dry-run:Validate inputs without starting'
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe 'opensop command' commands
+  else
+    _files
+  fi
+}
+
+_opensop "$@"
+```
+
+In `~/.zshrc`, make sure the completion directory is loaded:
+
+```zsh
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit
+compinit
+```
+
 ## Quick start
 
 Point the CLI at a server (the public demo is at `demo.opensop.ai`):
