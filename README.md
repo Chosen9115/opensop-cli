@@ -52,8 +52,8 @@ chmod +x /usr/local/bin/opensop
 ### Requirements
 
 - `bash` 4+ (any modern macOS or Linux)
-- `curl`
 - `jq` — `brew install jq` / `apt install jq`
+- `curl` — for the **server backend** only; `--local` execution doesn't need it
 
 ## Quick start
 
