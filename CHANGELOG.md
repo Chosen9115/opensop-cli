@@ -7,6 +7,21 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`opensop-local` — serverless local execution runtime.** Run a process
+  on-machine with no server (no Rails, no daemon, no network) — just `bash` +
+  `jq`. Reads a `.sop.json` process, runs `automated`/`shell`/`noop` steps in
+  order, threads a JSON context between them (stdin + `$OSL_CONTEXT`, stdout
+  merged under the step id), and writes an append-only on-disk receipt per step
+  (`$OPENSOP_LOCAL_HOME/runs/<id>/`). Includes `import-yaml` (`.sop.yaml` →
+  JSON), a worked example (`examples/greet.sop.json`), and a golden test
+  (`test/test.sh`). Complements the thin HTTP client with a true local runtime.
+
+---
+
 ## [0.4.1] — 2026-05-08
 
 ### Fixed

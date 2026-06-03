@@ -10,6 +10,22 @@ It works against any conformant OpenSOP server. The reference implementation is 
 
 It exists so agents (and humans) can use OpenSOP from any terminal, immediately, without writing curl invocations by hand.
 
+## Local execution — no server (`opensop-local`)
+
+`bin/opensop-local` is a companion runtime that **runs a process on your machine with no server at all** — no Rails app, no daemon, no network. It reads a process definition, runs its steps in order, threads a JSON context between them, and writes an append-only on-disk receipt per step.
+
+Where `opensop` is a thin client to a running OpenSOP server, `opensop-local` *is* the runtime — for development, CI, air-gapped/edge environments, and lightweight agents that can't carry a Ruby runtime. Same `bash` + `jq`, no extra deps.
+
+```bash
+opensop-local run examples/greet.sop.json --input name=opensop
+opensop-local runs                # past runs
+opensop-local show <run_id>       # manifest + per-step receipts
+opensop-local import-yaml p.sop.yaml   # convert .sop.yaml -> .sop.json (needs yq or PyYAML)
+bash test/test.sh                 # golden test
+```
+
+**Process format:** `.sop.json` (jq-native), mirroring `SPEC.md`. **Step I/O contract:** each step gets the accumulated context (inputs + prior outputs) on stdin and in `$OSL_CONTEXT`; its JSON stdout merges back under the step id. **Step types:** `automated`, `shell`, `noop` today; `form`/`approval`/`llm`/`webhook`/`subprocess`/`wait` are the roadmap for full SPEC parity. **Receipts:** `$OPENSOP_LOCAL_HOME/runs/<id>/{manifest.json, audit.jsonl, context.json}` (default `~/.opensop-local`). The same process file is meant to run on a server runtime *and* locally — portability is the point.
+
 ## Install
 
 ### One line
