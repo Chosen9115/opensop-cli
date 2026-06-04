@@ -7,7 +7,7 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ---
 
-## [Unreleased]
+## [0.5.0] — 2026-06-04
 
 ### Added
 
@@ -32,6 +32,23 @@ This project follows [Semantic Versioning](https://semver.org/) and the
   files). It previously aliased `OPENSOP_URL` to `http://localhost:3000`. For a
   local dev **server**, use `opensop config set url http://localhost:3000` or
   `OPENSOP_URL=http://localhost:3000` instead.
+
+### Fixed
+
+- **Failing steps are handled instead of aborting.** Under `set -e`, a non-zero
+  step previously aborted the whole CLI before the failure receipt, manifest
+  finalization, and `continue_on_error` could run. Step execution is now guarded
+  so failures are recorded (`failed` receipt + manifest `status:"failed"`) and
+  `continue_on_error` works.
+- **`runs` / `show` no longer require `curl`** — they are always-local commands.
+- **Interrupted runs no longer stick at `running`.** A killed/crashed run is
+  finalized as `interrupted` via an EXIT trap.
+- **Step `stderr` is captured** into the receipt (surfaced by `show`); empty
+  stderr logs are no longer left behind.
+- **Empty/malformed `steps` are rejected** up front instead of "completing"
+  trivially. `run_id` hardened against same-second/recycled-PID collisions.
+- Trust boundary documented (local steps run as shell — only run process files
+  you trust), and failure-path regression tests added to `test/test.sh`.
 
 ---
 
@@ -153,6 +170,7 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 - `X-SOP-Token` auth header support.
 - `NO_COLOR` support.
 
+[0.5.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Chosen9115/opensop-cli/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/Chosen9115/opensop-cli/compare/v0.3.0...v0.3.1
