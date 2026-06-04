@@ -274,11 +274,11 @@ Override per-call via env vars:
 OPENSOP_URL=https://prod.opensop.ai opensop list
 ```
 
-Use `--local` to target `http://localhost:3000` for a single call without changing your config:
+To point at a local dev **server** for a single call, set `OPENSOP_URL` inline (note: `--local` no longer does this — it now runs the [local execution backend](#two-backends-server-and-local---local) with no server at all):
 
 ```bash
-opensop list --local                        # hit your dev server
-opensop run lead-qualification --local ...  # test locally before prod
+OPENSOP_URL=http://localhost:3000 opensop list                       # hit your dev server
+OPENSOP_URL=http://localhost:3000 opensop run lead-qualification ... # test against it before prod
 ```
 
 ## Process authoring
