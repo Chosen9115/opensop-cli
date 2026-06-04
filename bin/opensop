@@ -291,6 +291,7 @@ ${C_BOLD}LOCAL EXECUTION (--local — internal files, no server)${C_RESET}
   list --local [dir]               list local .sop.json processes
   runs                             list local runs
   show <run_id>                    show a local run's manifest + per-step receipts
+  ${C_DIM}⚠ local steps run as shell on this machine — only run process files you trust${C_RESET}
 
 ${C_BOLD}AUTHORING${C_RESET}
   register <process.yaml>       POST a .sop.yaml to /sop/processes/register
@@ -1377,7 +1378,19 @@ cmd_schema_validate() {
 # =========================================================================== #
 
 _local_now()    { date -u +%Y-%m-%dT%H:%M:%SZ; }
-_local_run_id() { echo "$(date -u +%Y%m%dT%H%M%SZ)-$$"; }
+# timestamp + PID + $RANDOM: distinct across processes (PID) and hardened against
+# the rare same-second/recycled-PID collision. `date %N` is unportable (BSD), so
+# we don't rely on sub-second precision.
+_local_run_id() { echo "$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"; }
+
+# Mark a still-"running" manifest as interrupted. Registered as an EXIT trap
+# during a local run so a kill/crash never leaves a run stuck at "running".
+_local_finalize_trap() {
+  local mf="${1:-}/manifest.json"
+  [ -f "$mf" ] || return 0
+  jq -e '.status=="running"' "$mf" >/dev/null 2>&1 || return 0
+  jq -c '.status="interrupted"' "$mf" > "$mf.tmp" 2>/dev/null && mv "$mf.tmp" "$mf"
+}
 
 # opensop run <process.sop.json> --local [--input k=v ...]
 local_run() {
@@ -1393,14 +1406,21 @@ local_run() {
   inputs="$(echo "$built" | jq -c '.payload')"
   ctx="$(jq -c --argjson i "$inputs" '(.inputs // {}) * $i' "$proc_file")"  # declared defaults, overridden by --input
 
+  # Validate the steps array up front — before creating a run dir — so an empty
+  # or malformed process fails loudly instead of "completing" trivially.
+  local n_steps
+  n_steps="$(jq '(.steps // null) | if type=="array" then length else -1 end' "$proc_file")"
+  [ "$n_steps" -lt 0 ] && die "process has no valid \"steps\" array: $proc_file" "parse_error" "add a \"steps\": [ ... ] array"
+  [ "$n_steps" -eq 0 ] && die "process has no steps: $proc_file" "parse_error" "add at least one step to \"steps\""
+
   local run_id run_dir audit started
   run_id="$(_local_run_id)"; run_dir="$OPENSOP_LOCAL_HOME/runs/$run_id"
   mkdir -p "$run_dir"; audit="$run_dir/audit.jsonl"; started="$(_local_now)"
+  trap '_local_finalize_trap "$run_dir"' EXIT    # safety net: never leave a run "running"
   jq -nc --arg n "$name" --arg p "$proc_file" --arg id "$run_id" --arg t "$started" --argjson inp "$ctx" \
     '{run_id:$id, process:$n, process_file:$p, started_at:$t, status:"running", inputs:$inp}' > "$run_dir/manifest.json"
 
-  local n_steps i=0 run_status="completed"
-  n_steps="$(jq '.steps | length' "$proc_file")"
+  local i=0 run_status="completed"
   while [ "$i" -lt "$n_steps" ]; do
     local step sid stype srun scont
     step="$(jq -c ".steps[$i]" "$proc_file")"
@@ -1420,10 +1440,13 @@ local_run() {
         elif [ -f "$proc_dir/$script" ]; then script="$proc_dir/$script"
         elif [ -f "$(cd "$proc_dir/.." 2>/dev/null && pwd)/$script" ]; then script="$(cd "$proc_dir/.." && pwd)/$script"
         else script="$proc_dir/$script"; fi
+        # `|| rc=$?` is load-bearing: under `set -e` a bare `out_raw=$(failing)`
+        # would abort the whole CLI here, before rc is read — killing the failure
+        # receipt, manifest finalize, and continue_on_error. The `||` exempts it.
         if [ ! -f "$script" ]; then out_raw="step script not found: $script"; rc=127
-        else out_raw="$(OSL_CONTEXT="$ctx" OSL_RUN_DIR="$run_dir" OSL_STEP="$sid" bash "$script" <<<"$ctx" 2>>"$run_dir/$sid.stderr.log")"; rc=$?; fi ;;
+        else out_raw="$(OSL_CONTEXT="$ctx" OSL_RUN_DIR="$run_dir" OSL_STEP="$sid" bash "$script" <<<"$ctx" 2>>"$run_dir/$sid.stderr.log")" || rc=$?; fi ;;
       shell)
-        out_raw="$(OSL_CONTEXT="$ctx" OSL_RUN_DIR="$run_dir" OSL_STEP="$sid" bash -c "$srun" <<<"$ctx" 2>>"$run_dir/$sid.stderr.log")"; rc=$? ;;
+        out_raw="$(OSL_CONTEXT="$ctx" OSL_RUN_DIR="$run_dir" OSL_STEP="$sid" bash -c "$srun" <<<"$ctx" 2>>"$run_dir/$sid.stderr.log")" || rc=$? ;;
       noop) out_raw="{}"; rc=0 ;;
       *)    out_raw="unsupported step type for local execution: $stype"; rc=2 ;;
     esac
@@ -1436,9 +1459,15 @@ local_run() {
     fi
     s_ended="$(_local_now)"
     local sstatus; [ "$rc" -eq 0 ] && sstatus="completed" || sstatus="failed"
+    # Fold the step's stderr into the receipt so `show` surfaces it; drop the
+    # temp log afterwards (and never leave an empty one lying around).
+    local serr=""
+    [ -s "$run_dir/$sid.stderr.log" ] && serr="$(cat "$run_dir/$sid.stderr.log")"
+    rm -f "$run_dir/$sid.stderr.log"
     jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg st "$sstatus" --argjson rc "$rc" \
-      --arg a "$s_started" --arg b "$s_ended" --argjson out "$out_json" \
-      '{run_id:$rid, step:$sid, type:$t, status:$st, exit_code:$rc, started_at:$a, ended_at:$b, output:$out}' >> "$audit"
+      --arg a "$s_started" --arg b "$s_ended" --argjson out "$out_json" --arg se "$serr" \
+      '{run_id:$rid, step:$sid, type:$t, status:$st, exit_code:$rc, started_at:$a, ended_at:$b, output:$out}
+       + (if $se=="" then {} else {stderr:$se} end)' >> "$audit"
 
     if [ "$rc" -eq 0 ]; then
       ctx="$(jq -c --arg id "$sid" --argjson o "$out_json" '.[$id]=$o' <<<"$ctx")"
@@ -1454,6 +1483,7 @@ local_run() {
   echo "$ctx" > "$run_dir/context.json"
   jq -c --arg s "$run_status" --arg e "$ended" '.status=$s | .ended_at=$e' \
      "$run_dir/manifest.json" > "$run_dir/manifest.json.tmp" && mv "$run_dir/manifest.json.tmp" "$run_dir/manifest.json"
+  trap - EXIT    # finalized normally; drop the interrupted-run safety net
 
   if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
     if [ "$run_status" = completed ]; then ok "ran $C_BOLD$name$C_RESET locally — completed"; else err "ran $name locally — failed"; fi
@@ -1493,7 +1523,7 @@ local_show() {
       '{manifest:$m, steps:$s}'
   else
     info "── manifest ──"; jq . "$d/manifest.json"
-    info "── steps ──";   jq -c '{step,status,exit_code}' "$d/audit.jsonl" 2>/dev/null
+    info "── steps ──";   jq -c '{step,status,exit_code} + (if .stderr then {stderr:(.stderr|.[0:200])} else {} end)' "$d/audit.jsonl" 2>/dev/null
   fi
 }
 
@@ -1520,7 +1550,12 @@ main() {
 
   local cmd="$1"; shift
   load_config
-  [[ "$LOCAL_MODE" == true ]] || require_curl   # curl is only needed for the remote backend
+  # curl is only needed for the remote (server) backend. `runs`/`show` are always
+  # local, and any command with --local runs on-machine — none of them need curl.
+  case "$cmd" in
+    runs|show) ;;
+    *) [[ "$LOCAL_MODE" == true ]] || require_curl ;;
+  esac
 
   case "$cmd" in
     list)       cmd_list "$@" ;;
