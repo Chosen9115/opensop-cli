@@ -7,6 +7,34 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Local execution backend (`--local`) — no server.** The CLI now has two
+  backends: by default it talks to a running OpenSOP server; with `--local` the
+  *same commands* run on-machine against internal files — no Rails, no daemon,
+  no network, no `curl` (just `bash` + `jq`). `opensop run <process>.sop.json
+  --local` runs `automated`/`shell`/`noop` steps in order, threads a JSON
+  context between them (stdin + `$OSL_CONTEXT`, stdout merged under the step id),
+  and writes an append-only on-disk receipt per step
+  (`$OPENSOP_LOCAL_HOME/runs/<id>/`, default `~/.opensop-local`). This is an
+  extension of OpenSOP, not a separate tool.
+- **`runs`** — list local runs. **`show <run_id>`** — a local run's manifest +
+  per-step receipts (the local analogue of `instances` / `status`).
+- **`list --local [dir]`** — discover internal `.sop.json` processes.
+- A worked example (`examples/greet.sop.json` + `examples/steps/build.sh`) and a
+  golden test (`test/test.sh`).
+
+### Changed
+
+- **BREAKING: `--local` now means *local execution*** (run against internal
+  files). It previously aliased `OPENSOP_URL` to `http://localhost:3000`. For a
+  local dev **server**, use `opensop config set url http://localhost:3000` or
+  `OPENSOP_URL=http://localhost:3000` instead.
+
+---
+
 ## [0.4.1] — 2026-05-08
 
 ### Fixed

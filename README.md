@@ -10,6 +10,31 @@ It works against any conformant OpenSOP server. The reference implementation is 
 
 It exists so agents (and humans) can use OpenSOP from any terminal, immediately, without writing curl invocations by hand.
 
+## Two backends: server and local (`--local`)
+
+The CLI is one interface to **two backends**. By default it talks to a running OpenSOP server (the thin client described above). Add `--local` and the *same commands* run **on your machine against internal files — no server at all** (no Rails app, no daemon, no network):
+
+```bash
+opensop run lead-qualification --input lead_name=Ana   # remote: hits the configured server
+opensop run ./greet.sop.json --local --input name=Ana  # local: runs internal files, no server
+```
+
+Local execution is an extension of OpenSOP, not a separate tool — for development, CI, air-gapped/edge environments, and lightweight agents that can't carry a Ruby runtime. Local mode needs only `bash` + `jq` (no `curl`).
+
+```bash
+opensop run ./greet.sop.json --local   # run a process locally; same input flags as remote run
+opensop list --local [dir]             # list internal .sop.json processes
+opensop runs                           # list local runs
+opensop show <run_id>                  # a local run's manifest + per-step receipts
+bash test/test.sh                      # golden test
+```
+
+**Process format:** `.sop.json` (jq-native), mirroring `SPEC.md`. **Step I/O contract:** each step gets the accumulated context (inputs + prior outputs) on stdin and in `$OSL_CONTEXT`; its JSON stdout merges back under the step id. **Step types (local):** `automated`, `shell`, `noop` today; `form`/`approval`/`llm`/`webhook`/`subprocess`/`wait` are the roadmap for full SPEC parity. **Receipts:** `$OPENSOP_LOCAL_HOME/runs/<id>/{manifest.json, audit.jsonl, context.json}` (default `~/.opensop-local`). The same process file is meant to run on a server runtime *and* locally — portability is the point.
+
+> **⚠ Trust boundary:** local steps execute as shell **on your machine** — a `.sop.json`'s `shell`/`automated` steps run arbitrary commands. Only run process files you trust (same posture as a `Makefile` or an npm `postinstall`). This matters most for agents: don't `run --local` a process file you just fetched from an untrusted source.
+>
+> **Note:** `--local` now means *local execution*. (It previously aliased `OPENSOP_URL` to `http://localhost:3000` — for a local dev *server*, use `opensop config set url http://localhost:3000` or `OPENSOP_URL=...` instead.)
+
 ## Install
 
 ### One line
@@ -29,8 +54,8 @@ chmod +x /usr/local/bin/opensop
 ### Requirements
 
 - `bash` 4+ (any modern macOS or Linux)
-- `curl`
 - `jq` — `brew install jq` / `apt install jq`
+- `curl` — for the **server backend** only; `--local` execution doesn't need it
 
 ## Quick start
 
