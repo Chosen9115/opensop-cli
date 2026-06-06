@@ -1,10 +1,15 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## What this is
+# opensop-cli — Claude Code project guide
 
 `opensop-cli` is the entire product: a single bash file, `bin/opensop` (~1600 lines), that is a client for any [OpenSOP](https://github.com/Chosen9115/opensop) runtime. There is no build step, no package manager, no compiled artifact — the file *is* the binary. Read it top-to-bottom to understand it; it's organized into banner-delimited sections.
+
+## Stack
+
+- **Bash 4+** — macOS ships 3.2; install via Homebrew (`brew install bash`) if you hit array or `set -u` issues on 3.x.
+- **`curl`** — default remote backend.
+- **`jq`** — JSON parsing in both remote and `--local` backends.
+- **`shellcheck`** (optional) — linting; pre-existing warnings documented under Bash invariants.
+
+No package manager, no build step, no compiled artifact.
 
 ## Commands
 
