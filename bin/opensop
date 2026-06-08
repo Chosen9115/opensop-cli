@@ -690,7 +690,7 @@ ${C_BOLD}EXECUTION${C_RESET}
 
 ${C_BOLD}LOCAL EXECUTION (--local — internal files, no server)${C_RESET}
   run <name|file.sop.json> --local  run a process locally; bare name resolves across the cell chain (nearest wins)
-  list --local [dir]                list local processes; no arg + inside a cell walks active cell + ancestors
+  list --local [dir] [--conflicts]  list local processes; no arg + inside a cell walks the chain; --conflicts marks shadowed entries
   runs                              list local runs
   show <run_id>                     show a local run's manifest + per-step receipts
   ${C_DIM}⚠ local steps run as shell on this machine — only run process files you trust${C_RESET}
@@ -1976,9 +1976,23 @@ _find_skill_in_cells() {
 # (nearest first). Tags each row with [cell-name]. When given an explicit
 # dir, falls back to the original find-based behavior for backwards compat.
 local_list() {
-  if [[ $# -gt 0 ]]; then
-    # Explicit dir: original behavior — pure find, no cell awareness
-    local dir="$1"
+  # Parse local-engine flags. Positional args (a directory) preserved.
+  local conflicts_mode=false dir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --conflicts) conflicts_mode=true; shift ;;
+      --*) die "unknown flag for list: $1" "unknown_flag" "run opensop help" ;;
+      *)
+        if [[ -z "$dir" ]]; then dir="$1"; shift
+        else die "unexpected arg: $1" "usage_error" "usage: opensop list --local [dir] [--conflicts]"
+        fi
+        ;;
+    esac
+  done
+
+  if [[ -n "$dir" ]]; then
+    # Explicit dir: original behavior — pure find, no cell awareness, no
+    # --conflicts (there's no cell chain to shadow against).
     find "$dir" -maxdepth 2 -name '*.sop.json' 2>/dev/null | while read -r f; do
       printf "%-28s %s\n" "$(jq -r '.name // "?"' "$f" 2>/dev/null)" "$f"
     done
@@ -1995,15 +2009,34 @@ local_list() {
   fi
 
   # Inside a cell: walk active + ancestors, tag each with [cell-name].
-  # No dedup — when a name appears in multiple cells, all rows show.
-  # `opensop run <name>` resolves nearest-wins. Future: --conflicts flag.
+  # When --conflicts is set, mark the first occurrence of each filename
+  # as active and subsequent ones as shadowed (PATH-style nearest-wins).
+  #
+  # Tracking uses a space-separated string ("basename:cellname" entries
+  # bookended with spaces) rather than an associative array, so the
+  # function works on bash 3.2 too. Basename characters that contain
+  # spaces would break this — but .sop.json basenames are conventionally
+  # [a-z0-9_-] and the convention pre-dates this PR.
+  local _seen=" "
   local d cell_name
   for d in "$cell" $(_enumerate_ancestors "$cell"); do
     [[ -d "$d/processes" ]] || continue
     cell_name="$(_read_manifest_field "$d" name)"
     while IFS= read -r f; do
+      local bn; bn="$(basename "$f" .sop.json)"
       local n; n="$(jq -r '.name // "?"' "$f" 2>/dev/null)"
-      printf "[%s]  %-28s %s\n" "$cell_name" "$n" "$f"
+      if $conflicts_mode; then
+        case "$_seen" in
+          *" $bn:"*)
+            local marker_cell="${_seen##* $bn:}"; marker_cell="${marker_cell%% *}"
+            printf "[%s]  %-28s %s  ← shadowed by [%s]\n" "$cell_name" "$n" "$f" "$marker_cell" ;;
+          *)
+            _seen="$_seen$bn:$cell_name "
+            printf "[%s]  %-28s %s  ← active\n" "$cell_name" "$n" "$f" ;;
+        esac
+      else
+        printf "[%s]  %-28s %s\n" "$cell_name" "$n" "$f"
+      fi
     done < <(find "$d/processes" -maxdepth 1 -name '*.sop.json' 2>/dev/null)
   done
 }
