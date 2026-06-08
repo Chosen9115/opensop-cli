@@ -461,8 +461,8 @@ ${C_BOLD}LOCAL EXECUTION (--local — internal files, no server)${C_RESET}
   ${C_DIM}⚠ local steps run as shell on this machine — only run process files you trust${C_RESET}
 
 ${C_BOLD}CELLS (v0.6 — fractal addressing)${C_RESET}
-  init [--name N] [--parent PATH]  create .opensop/ in cwd; cwd becomes the active cell
-  scope                            print the active cell + ancestor chain
+  init [--name N] [--parent PATH]  create .opensop/ in cwd; parent auto-detected if cwd is inside an ancestor cell
+  scope                            print the active cell + ancestor chain (errors when cwd is not inside any cell)
 
 ${C_BOLD}AUTHORING${C_RESET}
   register <process.yaml>       POST a .sop.yaml to /sop/processes/register
