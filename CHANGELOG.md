@@ -9,6 +9,19 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ## [Unreleased]
 
+### Changed
+
+- **`OPENSOP_LOCAL_HOME` default is now cell-aware (v0.6).** When cwd is inside
+  an OpenSOP cell (a directory with `.opensop/manifest.yaml`) AND the user has
+  not explicitly set `OPENSOP_LOCAL_HOME`, local-mode receipts (`opensop run
+  --local`, `opensop runs`, `opensop show`) now default to `<cell-root>/.opensop/`
+  instead of the global `~/.opensop-local`. Receipts land alongside the
+  processes that produced them, and each cell has its own receipt history.
+  Outside any cell, the default is still `~/.opensop-local` — no change.
+  Explicit `OPENSOP_LOCAL_HOME=…` always wins over the cell-aware default.
+  Backwards-compatible because it only kicks in when a `.opensop/` marker
+  exists in the cwd's path (no pre-v0.6 user has one).
+
 ### Added
 
 - **Cell primitive (v0.6) — `opensop init` and `opensop scope`.** A "cell" is a

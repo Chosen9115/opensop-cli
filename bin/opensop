@@ -90,7 +90,18 @@ die() { err "$@"; exit 1; }
 # Output mode: pretty | json. Set by --json / --pretty flags or auto-detected.
 OUTPUT_MODE="auto"
 LOCAL_MODE=false                                                  # --local: run against internal files (no server)
-OPENSOP_LOCAL_HOME="${OPENSOP_LOCAL_HOME:-$HOME/.opensop-local}"  # local run receipts
+# Local run receipts. v0.6: when inside an OpenSOP cell, the default becomes
+# the active cell's .opensop/ instead of the global ~/.opensop-local — so
+# receipts land alongside the processes that produced them. The explicit
+# env override (when the user sets OPENSOP_LOCAL_HOME themselves) always
+# wins. The cell-aware override is applied in main() after helpers are
+# loaded; here we just track whether the user set it explicitly.
+if [[ -n "${OPENSOP_LOCAL_HOME-}" ]]; then
+  _OPENSOP_LOCAL_HOME_EXPLICIT=true
+else
+  _OPENSOP_LOCAL_HOME_EXPLICIT=false
+fi
+OPENSOP_LOCAL_HOME="${OPENSOP_LOCAL_HOME:-$HOME/.opensop-local}"
 
 emit_json() {
   # Print compact JSON (stdin) — used for --json and piped output.
@@ -640,6 +651,7 @@ ${C_BOLD}ENVIRONMENT${C_RESET}
   OPENSOP_URL                   override config server URL for one call
   OPENSOP_TOKEN                 override config token for one call
   OPENSOP_HOME                  config + cache dir (default: ~/.opensop)
+  OPENSOP_LOCAL_HOME            local-mode receipts dir (default: active cell's .opensop/ when inside a cell; else ~/.opensop-local)
   NO_COLOR                      disable ANSI color output
 EOF
 }
@@ -1847,6 +1859,16 @@ main() {
 
   local cmd="$1"; shift
   load_config
+
+  # v0.6: when cwd is inside a cell AND the user didn't explicitly set
+  # OPENSOP_LOCAL_HOME, default it to the active cell's .opensop/ so
+  # local-mode receipts (cmd_run / runs / show) land in the cell that
+  # produced them. Explicit env override wins.
+  if ! $_OPENSOP_LOCAL_HOME_EXPLICIT; then
+    local _cell_for_runs; _cell_for_runs="$(_find_scope_root)"
+    [[ -n "$_cell_for_runs" ]] && OPENSOP_LOCAL_HOME="$_cell_for_runs/.opensop"
+  fi
+
   # curl is only needed for the remote (server) backend. `runs`/`show` are always
   # local, and any command with --local runs on-machine — none of them need curl.
   case "$cmd" in
