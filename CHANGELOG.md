@@ -7,6 +7,20 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Cell primitive (v0.6) — `opensop init` and `opensop scope`.** A "cell" is a
+  directory marked by `.opensop/manifest.yaml`. `init` creates one in cwd
+  (auto-detecting the parent cell when an ancestor `.opensop/` exists);
+  `scope` walks up from cwd and prints the active cell + ancestor chain.
+  Pure-additive — no existing command behavior changes. Foundation for the
+  rest of v0.6 (lineage, per-cell receipts, name resolution across cells,
+  fork mechanic, `executor` field).
+
+---
+
 ## [0.5.0] — 2026-06-04
 
 ### Added

@@ -344,6 +344,9 @@ POSTs the file to `/sop/processes/register`. On success, prints `registered <nam
 | **Authoring** | |
 | `opensop register <process.yaml>` | POST a `.sop.yaml` to `/sop/processes/register` |
 | `opensop schema validate <file.yaml>` | Client-side YAML lint — no server round-trip |
+| **Cells (v0.6)** | |
+| `opensop init [--name N] [--parent PATH]` | Create `.opensop/` in cwd; cwd becomes the active cell. Auto-detects parent from ancestor cell when present. |
+| `opensop scope` | Print the active cell + ancestor chain (nearest-first); errors if cwd is not inside a cell |
 | **Admin** | |
 | `opensop instances [--state X] [--process Y]` | Paginated list (`GET /sop/instances`) |
 | **Config** | |
