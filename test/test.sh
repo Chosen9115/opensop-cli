@@ -362,4 +362,90 @@ set -e
 [ "$ncrc" -ne 0 ] || { echo "FAIL: run by name outside any cell should exit non-zero"; exit 1; }
 echo "PASS: run — bare name outside any cell errors (no cell chain to search)"
 
+# --------------------------------------------------------------------------- #
+# Fork mechanic (v0.6 PR 5): materialize an ancestor's skill in the active
+# cell + record a lineage entry with forked_from snapshot of parent state.
+# --------------------------------------------------------------------------- #
+fk_org="$OPENSOP_LOCAL_HOME/fk-org"
+fk_team="$fk_org/team"
+mkdir -p "$fk_team"
+( cd "$fk_org"  && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+
+mkdir -p "$fk_org/processes"
+cat > "$fk_org/processes/greet-skill.sop.json" <<'JSON'
+{ "name": "greet-skill", "inputs": {}, "steps": [{"id":"x","type":"shell","run":"echo greet"}] }
+JSON
+
+# Seed parent's lineage with a non-trivial policy state to test snapshotting
+fk_lineage="$fk_org/.opensop/lineage.json"
+jq --arg name "greet-skill" \
+   '.[$name] = {logical_name:$name, forked_from:null, history:[{at:"2026-01-01T00:00:00Z",type:"promote",data:{to:"m3"}}], status:"mineralized", metadata:{m:"3.247"}}' \
+   "$fk_lineage" > "$fk_lineage.tmp" && mv "$fk_lineage.tmp" "$fk_lineage"
+
+# (1) Fork from team auto-detects org as the source (walk-up)
+fork_out=$( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" fork greet-skill --json )
+[ "$(jq -r '.ok'             <<<"$fork_out")" = "true" ]                       || { echo "FAIL: fork ok!=true"; exit 1; }
+[ "$(jq -r '.source_cell'    <<<"$fork_out")" = "$fk_org" ]                    || { echo "FAIL: fork source_cell wrong"; exit 1; }
+[ "$(jq -r '.dest_file'      <<<"$fork_out")" = "$fk_team/processes/greet-skill.sop.json" ] || { echo "FAIL: fork dest_file wrong"; exit 1; }
+[ -f "$fk_team/processes/greet-skill.sop.json" ]                               || { echo "FAIL: file not copied to child cell"; exit 1; }
+echo "PASS: fork — copies file from ancestor's processes/ into active cell"
+
+# (2) Child's lineage entry has forked_from with the parent's policy snapshot
+child_lineage="$fk_team/.opensop/lineage.json"
+[ "$(jq -r '."greet-skill".forked_from.cell' "$child_lineage")"                = "$fk_org" ]    || { echo "FAIL: forked_from.cell wrong"; exit 1; }
+[ -n "$(jq -r '."greet-skill".forked_from.forked_at' "$child_lineage")" ]                       || { echo "FAIL: forked_at missing"; exit 1; }
+[ "$(jq -r '."greet-skill".forked_from.snapshot.status' "$child_lineage")"      = "mineralized" ] || { echo "FAIL: snapshot.status wrong"; exit 1; }
+[ "$(jq -r '."greet-skill".forked_from.snapshot.metadata.m' "$child_lineage")"  = "3.247" ]       || { echo "FAIL: snapshot.metadata.m wrong"; exit 1; }
+echo "PASS: fork — child's forked_from captures parent's status + metadata as snapshot"
+
+# (3) Child's live status + metadata are empty (substrate is policy-neutral; let policy set them)
+[ "$(jq -r '."greet-skill".status'           "$child_lineage")" = "" ]  || { echo "FAIL: child's live status should be empty after fork"; exit 1; }
+[ "$(jq -c '."greet-skill".metadata'         "$child_lineage")" = "{}" ] || { echo "FAIL: child's live metadata should be empty after fork"; exit 1; }
+[ "$(jq -r '."greet-skill".history | length' "$child_lineage")" = "0" ]  || { echo "FAIL: child's history should start empty"; exit 1; }
+echo "PASS: fork — child's live status/metadata/history start empty (policy populates)"
+
+# (4) Parent's lineage is NOT modified by the fork
+[ "$(jq -r '."greet-skill".status'     "$fk_lineage")" = "mineralized" ] || { echo "FAIL: parent's status was modified by fork"; exit 1; }
+[ "$(jq -r '."greet-skill".metadata.m' "$fk_lineage")" = "3.247" ]       || { echo "FAIL: parent's metadata was modified by fork"; exit 1; }
+echo "PASS: fork — parent's lineage is untouched"
+
+# (5) Refuses to overwrite an existing skill in the active cell
+set +e
+( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" fork greet-skill --json >/dev/null 2>&1 ); fk_rc1=$?
+set -e
+[ "$fk_rc1" -ne 0 ] || { echo "FAIL: re-fork into a cell that already has the skill should exit non-zero"; exit 1; }
+echo "PASS: fork — refuses to overwrite an existing skill in active cell"
+
+# (6) Errors on non-existent skill
+set +e
+( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" fork no-such-skill --json >/dev/null 2>&1 ); fk_rc2=$?
+set -e
+[ "$fk_rc2" -ne 0 ] || { echo "FAIL: fork of non-existent skill should exit non-zero"; exit 1; }
+echo "PASS: fork — errors when skill not found in any ancestor"
+
+# (7) Outside any cell — errors (need a cell to fork into)
+set +e
+( cd "$OPENSOP_LOCAL_HOME" && env -u OPENSOP_LOCAL_HOME "$cli" fork greet-skill --json >/dev/null 2>&1 ); fk_rc3=$?
+set -e
+[ "$fk_rc3" -ne 0 ] || { echo "FAIL: fork outside any cell should exit non-zero"; exit 1; }
+echo "PASS: fork — errors when not inside a cell"
+
+# (8) --from <path> override resolves explicitly
+mkdir -p "$OPENSOP_LOCAL_HOME/fk-isolated"
+( cd "$OPENSOP_LOCAL_HOME/fk-isolated" && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+mkdir -p "$OPENSOP_LOCAL_HOME/fk-isolated/processes"
+cat > "$OPENSOP_LOCAL_HOME/fk-isolated/processes/explicit-src.sop.json" <<'JSON'
+{ "name": "explicit-src", "inputs": {}, "steps": [{"id":"x","type":"shell","run":"echo ok"}] }
+JSON
+fk_explicit=$( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" fork explicit-src --from "$OPENSOP_LOCAL_HOME/fk-isolated" --json )
+[ "$(jq -r '.source_cell' <<<"$fk_explicit")" = "$OPENSOP_LOCAL_HOME/fk-isolated" ] || { echo "FAIL: --from override not honored"; exit 1; }
+[ -f "$fk_team/processes/explicit-src.sop.json" ]                                   || { echo "FAIL: --from fork didn't copy file"; exit 1; }
+echo "PASS: fork — --from <cell> override copies from a non-ancestor cell"
+
+# (9) Integration: after fork, name-resolution (PR #9) finds child's copy first
+m_resolved=$( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" run greet-skill --local --json )
+[ "$(jq -r '.process_file' <<<"$m_resolved")" = "$fk_team/processes/greet-skill.sop.json" ] || { echo "FAIL: name resolution didn't pick child's forked copy"; exit 1; }
+echo "PASS: fork + run — forked skill is nearest-wins for name resolution"
+
 echo "ALL PASS"
