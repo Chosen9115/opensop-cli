@@ -589,10 +589,10 @@ ${C_BOLD}EXECUTION${C_RESET}
   cancel <id> [--reason TEXT]   cancel a running instance
 
 ${C_BOLD}LOCAL EXECUTION (--local — internal files, no server)${C_RESET}
-  run <process.sop.json> --local   run a process locally; same input flags as remote run
-  list --local [dir]               list local .sop.json processes
-  runs                             list local runs
-  show <run_id>                    show a local run's manifest + per-step receipts
+  run <name|file.sop.json> --local  run a process locally; bare name resolves across the cell chain (nearest wins)
+  list --local [dir]                list local processes; no arg + inside a cell walks active cell + ancestors
+  runs                              list local runs
+  show <run_id>                     show a local run's manifest + per-step receipts
   ${C_DIM}⚠ local steps run as shell on this machine — only run process files you trust${C_RESET}
 
 ${C_BOLD}CELLS (v0.6 — fractal addressing)${C_RESET}
@@ -1703,8 +1703,21 @@ _local_finalize_trap() {
 
 # opensop run <process.sop.json> --local [--input k=v ...]
 local_run() {
-  [[ $# -lt 1 ]] && die "usage: opensop run <process.sop.json> --local [--input KEY=VALUE ...]" "usage_error" "run opensop help"
-  local proc_file="$1"; shift
+  [[ $# -lt 1 ]] && die "usage: opensop run <name|process.sop.json> --local [--input KEY=VALUE ...]" "usage_error" "run opensop help"
+  local proc_arg="$1"; shift
+
+  # v0.6: argument resolution.
+  #   path-shaped (contains '/' or ends in .sop.json) → use as a file path
+  #   bare name → resolve across the active cell chain (nearest wins)
+  local proc_file=""
+  if [[ "$proc_arg" == *.sop.json ]] || [[ "$proc_arg" == */* ]]; then
+    proc_file="$proc_arg"
+  else
+    proc_file="$(_find_skill_in_cells "$proc_arg")"
+    [[ -z "$proc_file" ]] && die "skill not found: '$proc_arg' (looked in active cell + ancestors)" "file_not_found" \
+        "create processes/${proc_arg}.sop.json in a cell, or pass an explicit path"
+  fi
+
   [[ -f "$proc_file" ]] || die "process file not found: $proc_file" "file_not_found"
   jq -e . "$proc_file" >/dev/null 2>&1 || die "process file is not valid JSON: $proc_file" "invalid_json"
 
@@ -1805,11 +1818,62 @@ local_run() {
   [ "$run_status" = completed ]
 }
 
+# _find_skill_in_cells <name>
+#   Walk the cell chain (active cell + ancestors, nearest first) looking for
+#   processes/<name>.sop.json. Echo first match (nearest wins), empty if none.
+_find_skill_in_cells() {
+  local name="$1"
+  local cell; cell="$(_find_scope_root)"
+  [[ -z "$cell" ]] && return 0
+  if [[ -f "$cell/processes/${name}.sop.json" ]]; then
+    echo "$cell/processes/${name}.sop.json"
+    return 0
+  fi
+  while IFS= read -r ancestor; do
+    [[ -z "$ancestor" ]] && continue
+    if [[ -f "$ancestor/processes/${name}.sop.json" ]]; then
+      echo "$ancestor/processes/${name}.sop.json"
+      return 0
+    fi
+  done < <(_enumerate_ancestors "$cell")
+}
+
 # opensop list --local [dir]  — discover internal .sop.json processes
+#
+# v0.6: when called with no arg AND cwd is inside a cell, enumerate skills
+# from the active cell's processes/ then from each ancestor's processes/
+# (nearest first). Tags each row with [cell-name]. When given an explicit
+# dir, falls back to the original find-based behavior for backwards compat.
 local_list() {
-  local dir="${1:-.}"
-  find "$dir" -maxdepth 2 -name '*.sop.json' 2>/dev/null | while read -r f; do
-    printf "%-28s %s\n" "$(jq -r '.name // "?"' "$f" 2>/dev/null)" "$f"
+  if [[ $# -gt 0 ]]; then
+    # Explicit dir: original behavior — pure find, no cell awareness
+    local dir="$1"
+    find "$dir" -maxdepth 2 -name '*.sop.json' 2>/dev/null | while read -r f; do
+      printf "%-28s %s\n" "$(jq -r '.name // "?"' "$f" 2>/dev/null)" "$f"
+    done
+    return 0
+  fi
+
+  local cell; cell="$(_find_scope_root)"
+  if [[ -z "$cell" ]]; then
+    # Not in a cell: original cwd-scoped find
+    find . -maxdepth 2 -name '*.sop.json' 2>/dev/null | while read -r f; do
+      printf "%-28s %s\n" "$(jq -r '.name // "?"' "$f" 2>/dev/null)" "$f"
+    done
+    return 0
+  fi
+
+  # Inside a cell: walk active + ancestors, tag each with [cell-name].
+  # No dedup — when a name appears in multiple cells, all rows show.
+  # `opensop run <name>` resolves nearest-wins. Future: --conflicts flag.
+  local d cell_name
+  for d in "$cell" $(_enumerate_ancestors "$cell"); do
+    [[ -d "$d/processes" ]] || continue
+    cell_name="$(_read_manifest_field "$d" name)"
+    while IFS= read -r f; do
+      local n; n="$(jq -r '.name // "?"' "$f" 2>/dev/null)"
+      printf "[%s]  %-28s %s\n" "$cell_name" "$n" "$f"
+    done < <(find "$d/processes" -maxdepth 1 -name '*.sop.json' 2>/dev/null)
   done
 }
 

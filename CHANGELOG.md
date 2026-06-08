@@ -11,6 +11,20 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ### Changed
 
+- **Name resolution across the cell chain (v0.6).** Two changes to the local
+  engine when a cell is active:
+  - `opensop run <name> --local` accepts a **bare logical name** (in addition
+    to a file path). The name resolves to `processes/<name>.sop.json` in the
+    active cell, then in each ancestor cell — nearest wins. Explicit file
+    paths still work for backwards compatibility (paths are detected when the
+    argument ends in `.sop.json` or contains `/`).
+  - `opensop list --local` (no dir arg) now walks the active cell + ancestors
+    when invoked from inside a cell, tagging each entry with `[cell-name]`.
+    Passing an explicit `dir` keeps the original `find`-based behavior with
+    no cell awareness.
+  No dedup yet; same logical name in multiple cells shows all rows. A future
+  `--conflicts` flag will distinguish "nearest" from "shadowed."
+
 - **`OPENSOP_LOCAL_HOME` default is now cell-aware (v0.6).** When cwd is inside
   an OpenSOP cell (a directory with `.opensop/manifest.yaml`) AND the user has
   not explicitly set `OPENSOP_LOCAL_HOME`, local-mode receipts (`opensop run
