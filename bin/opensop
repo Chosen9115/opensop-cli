@@ -372,7 +372,7 @@ cmd_init() {
   } > "$cwd/.opensop/manifest.yaml"
   echo "{}" > "$cwd/.opensop/lineage.json"
 
-  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+  if [[ "$OUTPUT_MODE" == "pretty" ]] || { [[ "$OUTPUT_MODE" == "auto" ]] && is_tty; }; then
     info "${C_GREEN}initialized cell '$name'${C_RESET} at $cwd/.opensop/"
     if [[ -n "$parent_resolved" ]]; then
       info "  parent: $parent_resolved"
@@ -398,7 +398,7 @@ cmd_scope() {
 
   local name; name="$(_read_manifest_field "$cell_root" name)"
 
-  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+  if [[ "$OUTPUT_MODE" == "pretty" ]] || { [[ "$OUTPUT_MODE" == "auto" ]] && is_tty; }; then
     info "${C_BOLD}active cell:${C_RESET} $name"
     info "  $cell_root"
     local printed_header=false
@@ -500,7 +500,7 @@ cmd_annotate() {
 
   _lineage_write "$cell_root" "$new_lineage"
 
-  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+  if [[ "$OUTPUT_MODE" == "pretty" ]] || { [[ "$OUTPUT_MODE" == "auto" ]] && is_tty; }; then
     info "${C_GREEN}annotated${C_RESET} '$skill' with event '$event_type' at $now"
   else
     echo "$event"
@@ -525,7 +525,7 @@ cmd_lineage() {
     entry="$(_lineage_default_entry "$skill")"
   fi
 
-  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+  if [[ "$OUTPUT_MODE" == "pretty" ]] || { [[ "$OUTPUT_MODE" == "auto" ]] && is_tty; }; then
     local n_events status
     n_events="$(jq -r '.history | length' <<<"$entry")"
     status="$(jq -r '.status // ""' <<<"$entry")"
