@@ -16,7 +16,7 @@ set -euo pipefail
 # Constants & paths
 # --------------------------------------------------------------------------- #
 
-readonly OPENSOP_CLI_VERSION="0.5.0"
+readonly OPENSOP_CLI_VERSION="0.6.0"
 readonly OPENSOP_HOME="${OPENSOP_HOME:-$HOME/.opensop}"
 readonly CONFIG_FILE="$OPENSOP_HOME/config"
 readonly CACHE_FILE="$OPENSOP_HOME/instances.tsv"
