@@ -9,9 +9,41 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-06-08
+
+The cell substrate. Six PRs (#6, #7, #8, #9, #10, #11) added a fractal
+addressing primitive, a substrate-level event log per skill, name resolution
+across the cell chain, fork with lineage, per-cell receipts, and the
+executor field. Backwards-compatible — every pre-v0.6 usage continues to
+work; v0.6 features only activate inside a cell.
+
 ### Added
 
-- **Step executor field (v0.6) — `executor: internal|external`.** Steps in a
+- **Cell primitive — `opensop init` and `opensop scope`.** A "cell" is a
+  directory marked by `.opensop/manifest.yaml`. `init` creates one in cwd
+  (auto-detecting the parent cell when an ancestor `.opensop/` exists);
+  `scope` walks up from cwd and prints the active cell + ancestor chain.
+  Pure-additive — no existing command behavior changes. Foundation for the
+  rest of v0.6.
+- **Lineage primitives — `opensop annotate` and `opensop lineage`.**
+  Substrate-level event log per skill stored in `.opensop/lineage.json` in
+  each cell. `annotate <skill> <event-type> <json>` appends a policy event
+  to the skill's history (creates the lineage entry if it doesn't exist).
+  `lineage <skill>` prints the entry (status, metadata, history) in the
+  active cell, returning an empty default if no events have been recorded.
+  Policy-neutral: the substrate stores `status` (open string), `metadata`
+  (open object), and `history[].type` (open string); it doesn't interpret
+  any of them. This is what evolution policies (e.g. mineralization) sit on
+  top of to record promotions, demotions, locks, etc.
+- **Fork mechanic — `opensop fork <name> [--from <cell>]`.** Materializes
+  a copy of an ancestor cell's skill into the active cell and records a lineage
+  entry with `forked_from = { cell, forked_at, snapshot }`. The `snapshot` is
+  the parent's `status` and `metadata` captured opaquely — the substrate stores;
+  evolution policies decide what to do with it (typical: inherit + mark
+  unverified until first run in the child cell). Auto-detects the source via
+  walk-up; pass `--from` to override. Refuses to overwrite an existing skill
+  in the active cell.
+- **Step executor field — `executor: internal|external`.** Steps in a
   `.sop.json` may declare where their work happens: `external` means the work
   is done by a process outside the OpenSOP runtime (script, webhook); the
   runtime orchestrates and receives the receipt. `internal` means the runtime
@@ -20,23 +52,13 @@ This project follows [Semantic Versioning](https://semver.org/) and the
   `notification`/`wait`/`judgment` → internal). Invalid values fail with
   `parse_error` at process load time — before any step runs and before a run
   directory is even created. The effective executor (explicit or defaulted)
-  is recorded in each step's `audit.jsonl` entry. This formalizes the
-  B-mode-vs-A-mode distinction from the v0.6 spec and matches existing
-  production patterns (deterministic external scripts producing typed
-  receipts).
-
-- **Fork mechanic (v0.6) — `opensop fork <name> [--from <cell>]`.** Materializes
-  a copy of an ancestor cell's skill into the active cell and records a lineage
-  entry with `forked_from = { cell, forked_at, snapshot }`. The `snapshot` is
-  the parent's `status` and `metadata` captured opaquely — the substrate stores;
-  evolution policies decide what to do with it (typical: inherit + mark
-  unverified until first run in the child cell). Auto-detects the source via
-  walk-up; pass `--from` to override. Refuses to overwrite an existing skill
-  in the active cell.
+  is recorded in each step's `audit.jsonl` entry. Formalizes the
+  B-mode-vs-A-mode distinction and matches existing production patterns
+  (deterministic external scripts producing typed receipts).
 
 ### Changed
 
-- **Name resolution across the cell chain (v0.6).** Two changes to the local
+- **Name resolution across the cell chain.** Two changes to the local
   engine when a cell is active:
   - `opensop run <name> --local` accepts a **bare logical name** (in addition
     to a file path). The name resolves to `processes/<name>.sop.json` in the
@@ -47,39 +69,15 @@ This project follows [Semantic Versioning](https://semver.org/) and the
     when invoked from inside a cell, tagging each entry with `[cell-name]`.
     Passing an explicit `dir` keeps the original `find`-based behavior with
     no cell awareness.
-  No dedup yet; same logical name in multiple cells shows all rows. A future
-  `--conflicts` flag will distinguish "nearest" from "shadowed."
-
-- **`OPENSOP_LOCAL_HOME` default is now cell-aware (v0.6).** When cwd is inside
-  an OpenSOP cell (a directory with `.opensop/manifest.yaml`) AND the user has
-  not explicitly set `OPENSOP_LOCAL_HOME`, local-mode receipts (`opensop run
-  --local`, `opensop runs`, `opensop show`) now default to `<cell-root>/.opensop/`
-  instead of the global `~/.opensop-local`. Receipts land alongside the
-  processes that produced them, and each cell has its own receipt history.
-  Outside any cell, the default is still `~/.opensop-local` — no change.
-  Explicit `OPENSOP_LOCAL_HOME=…` always wins over the cell-aware default.
-  Backwards-compatible because it only kicks in when a `.opensop/` marker
-  exists in the cwd's path (no pre-v0.6 user has one).
-
-### Added
-
-- **Cell primitive (v0.6) — `opensop init` and `opensop scope`.** A "cell" is a
-  directory marked by `.opensop/manifest.yaml`. `init` creates one in cwd
-  (auto-detecting the parent cell when an ancestor `.opensop/` exists);
-  `scope` walks up from cwd and prints the active cell + ancestor chain.
-  Pure-additive — no existing command behavior changes. Foundation for the
-  rest of v0.6 (lineage, per-cell receipts, name resolution across cells,
-  fork mechanic, `executor` field).
-- **Lineage primitives (v0.6) — `opensop annotate` and `opensop lineage`.**
-  Substrate-level event log per skill stored in `.opensop/lineage.json` in
-  each cell. `annotate <skill> <event-type> <json>` appends a policy event
-  to the skill's history (creates the lineage entry if it doesn't exist).
-  `lineage <skill>` prints the entry (status, metadata, history) in the
-  active cell, returning an empty default if no events have been recorded.
-  Policy-neutral: the substrate stores `status` (open string), `metadata`
-  (open object), and `history[].type` (open string); it doesn't interpret
-  any of them. This is what evolution policies like mineralization sit on
-  top of to record promotions, demotions, locks, etc.
+- **`OPENSOP_LOCAL_HOME` default is now cell-aware.** When cwd is inside
+  an OpenSOP cell AND the user has not explicitly set `OPENSOP_LOCAL_HOME`,
+  local-mode receipts (`opensop run --local`, `opensop runs`, `opensop show`)
+  now default to `<cell-root>/.opensop/` instead of the global
+  `~/.opensop-local`. Receipts land alongside the processes that produced
+  them, and each cell has its own receipt history. Outside any cell, the
+  default is still `~/.opensop-local`. Explicit `OPENSOP_LOCAL_HOME=…` always
+  wins. Backwards-compatible because it only kicks in when a `.opensop/`
+  marker exists in cwd's path (no pre-v0.6 user has one).
 
 ---
 
@@ -246,6 +244,7 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 - `X-SOP-Token` auth header support.
 - `NO_COLOR` support.
 
+[0.6.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Chosen9115/opensop-cli/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.3.1...v0.4.0
