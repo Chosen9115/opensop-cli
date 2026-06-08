@@ -277,4 +277,24 @@ runs_list=$( cd "$runs_cell" && env -u OPENSOP_LOCAL_HOME "$cli" runs )
 [[ "$runs_list" != *"$rid2"* ]]                       || { echo "FAIL: 'opensop runs' inside cell shouldn't see override's run"; exit 1; }
 echo "PASS: runs — 'opensop runs' inside cell reads the cell's receipts only"
 
+# (4) Corrupt cell: .opensop/ directory without manifest.yaml is NOT a cell
+fake_cell="$OPENSOP_LOCAL_HOME/fake-cell"
+mkdir -p "$fake_cell/.opensop"
+set +e
+( cd "$fake_cell" && env -u OPENSOP_LOCAL_HOME "$cli" scope --json >/dev/null 2>&1 ); fcrc=$?
+set -e
+[ "$fcrc" -ne 0 ] || { echo "FAIL: cwd with .opensop/ but no manifest.yaml should NOT be recognized as a cell"; exit 1; }
+echo "PASS: cells — .opensop/ without manifest.yaml is correctly ignored (not a cell)"
+
+# (5) Nested cells: run from inner cell lands receipts in inner, not in outer
+mkdir -p "$OPENSOP_LOCAL_HOME/nested/outer/inner"
+( cd "$OPENSOP_LOCAL_HOME/nested/outer"       && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+( cd "$OPENSOP_LOCAL_HOME/nested/outer/inner" && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+
+m_inner=$( cd "$OPENSOP_LOCAL_HOME/nested/outer/inner" && env -u OPENSOP_LOCAL_HOME "$cli" run "$here/examples/greet.sop.json" --local --input name=nested-inner --json )
+rid_inner=$(jq -r '.run_id' <<<"$m_inner")
+[ -d "$OPENSOP_LOCAL_HOME/nested/outer/inner/.opensop/runs/$rid_inner" ] || { echo "FAIL: nested inner-cell run receipt not in inner"; exit 1; }
+[ ! -d "$OPENSOP_LOCAL_HOME/nested/outer/.opensop/runs/$rid_inner" ]     || { echo "FAIL: nested inner-cell run receipt leaked to outer"; exit 1; }
+echo "PASS: runs — nested cells route receipts to the innermost cell, not ancestors"
+
 echo "ALL PASS"
