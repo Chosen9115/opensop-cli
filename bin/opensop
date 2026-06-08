@@ -372,16 +372,16 @@ cmd_init() {
   } > "$cwd/.opensop/manifest.yaml"
   echo "{}" > "$cwd/.opensop/lineage.json"
 
-  if [[ "$(_resolve_output_mode)" == "json" ]]; then
-    jq -nc --arg root "$cwd" --arg name "$name" --arg parent "$parent_resolved" \
-      '{ok:true, cell_root:$root, name:$name, parent:(if $parent == "" then null else $parent end)}'
-  else
+  if [[ "$OUTPUT_MODE" == "pretty" ]] || { [[ "$OUTPUT_MODE" == "auto" ]] && is_tty; }; then
     info "${C_GREEN}initialized cell '$name'${C_RESET} at $cwd/.opensop/"
     if [[ -n "$parent_resolved" ]]; then
       info "  parent: $parent_resolved"
     else
       info "  parent: (root cell — no ancestor)"
     fi
+  else
+    jq -nc --arg root "$cwd" --arg name "$name" --arg parent "$parent_resolved" \
+      '{ok:true, cell_root:$root, name:$name, parent:(if $parent == "" then null else $parent end)}'
   fi
 }
 
@@ -398,18 +398,7 @@ cmd_scope() {
 
   local name; name="$(_read_manifest_field "$cell_root" name)"
 
-  if [[ "$(_resolve_output_mode)" == "json" ]]; then
-    local payload
-    payload="$(jq -n --arg name "$name" --arg root "$cell_root" \
-      '[{name:$name, root:$root, active:true}]')"
-    while IFS= read -r ancestor_root; do
-      [[ -z "$ancestor_root" ]] && continue
-      local a_name; a_name="$(_read_manifest_field "$ancestor_root" name)"
-      payload="$(jq --arg name "$a_name" --arg root "$ancestor_root" \
-        '. + [{name:$name, root:$root, active:false}]' <<<"$payload")"
-    done < <(_enumerate_ancestors "$cell_root")
-    echo "$payload"
-  else
+  if [[ "$OUTPUT_MODE" == "pretty" ]] || { [[ "$OUTPUT_MODE" == "auto" ]] && is_tty; }; then
     info "${C_BOLD}active cell:${C_RESET} $name"
     info "  $cell_root"
     local printed_header=false
@@ -420,6 +409,141 @@ cmd_scope() {
       info "  ↑ $a_name"
       info "    $ancestor_root"
     done < <(_enumerate_ancestors "$cell_root")
+  else
+    local payload
+    payload="$(jq -n --arg name "$name" --arg root "$cell_root" \
+      '[{name:$name, root:$root, active:true}]')"
+    while IFS= read -r ancestor_root; do
+      [[ -z "$ancestor_root" ]] && continue
+      local a_name; a_name="$(_read_manifest_field "$ancestor_root" name)"
+      payload="$(jq --arg name "$a_name" --arg root "$ancestor_root" \
+        '. + [{name:$name, root:$root, active:false}]' <<<"$payload")"
+    done < <(_enumerate_ancestors "$cell_root")
+    echo "$payload"
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Lineage (v0.6 — substrate-level event log per skill)
+#
+# Per-cell .opensop/lineage.json records `status` / `metadata` / `history`
+# for every skill the cell knows about. The substrate stores; policies
+# populate via `annotate` and read via `lineage`. Both `status` and
+# `metadata` are open — the substrate does not interpret them.
+#
+# Schema (per skill, keyed by logical_name in the top-level object):
+#   { logical_name, forked_from, history: [{at, type, data}], status, metadata }
+# --------------------------------------------------------------------------- #
+
+# _lineage_path <cell_root>  — echo absolute path of the cell's lineage.json
+_lineage_path() { echo "$1/.opensop/lineage.json"; }
+
+# _lineage_read <cell_root>
+#   Echo lineage.json contents (or '{}' if file missing). Errors on bad JSON.
+_lineage_read() {
+  local f; f="$(_lineage_path "$1")"
+  if [[ ! -f "$f" ]]; then
+    echo "{}"
+    return 0
+  fi
+  if ! jq -e . "$f" >/dev/null 2>&1; then
+    die "corrupt lineage file: $f" "invalid_json" "remove or fix the file"
+  fi
+  cat "$f"
+}
+
+# _lineage_write <cell_root> <json>  — atomic write via temp + mv
+_lineage_write() {
+  local f; f="$(_lineage_path "$1")"
+  local tmp="${f}.tmp.$$"
+  printf '%s\n' "$2" > "$tmp"
+  mv "$tmp" "$f"
+}
+
+# _lineage_default_entry <skill>  — echo the empty-default entry shape
+_lineage_default_entry() {
+  jq -nc --arg name "$1" \
+    '{logical_name: $name, forked_from: null, history: [], status: "", metadata: {}}'
+}
+
+# opensop annotate <skill> <event-type> <json>
+#   Append a policy event to the skill's lineage history in the active cell.
+#   Creates the lineage entry with default fields if it doesn't exist yet.
+#   Event type is open-string; data is whatever JSON the policy needs.
+cmd_annotate() {
+  [[ $# -lt 3 ]] && die "usage: opensop annotate <skill> <event-type> <json-data>" "usage_error" \
+                        "example: opensop annotate publish-linkedin promote '{\"to\":\"m4\"}'"
+  local skill="$1" event_type="$2" data_json="$3"
+
+  if ! jq -e . <<<"$data_json" >/dev/null 2>&1; then
+    die "invalid JSON data: $data_json" "invalid_json" \
+        "wrap data in single quotes; ensure it parses (e.g. '{\"key\":\"value\"}')"
+  fi
+
+  local cell_root; cell_root="$(_find_scope_root)"
+  [[ -z "$cell_root" ]] && die "not inside an OpenSOP cell — run 'opensop init' first" "usage_error" \
+                               "or cd into a directory under an existing cell"
+
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local lineage; lineage="$(_lineage_read "$cell_root")"
+
+  # Existing entry, or fresh default.
+  local entry; entry="$(jq -n --argjson l "$lineage" --arg s "$skill" '$l[$s] // null')"
+  if [[ "$entry" == "null" ]]; then
+    entry="$(_lineage_default_entry "$skill")"
+  fi
+
+  local event; event="$(jq -nc --arg at "$now" --arg type "$event_type" --argjson data "$data_json" \
+    '{at: $at, type: $type, data: $data}')"
+  local new_entry; new_entry="$(jq --argjson e "$event" '.history += [$e]' <<<"$entry")"
+  local new_lineage; new_lineage="$(jq --arg s "$skill" --argjson e "$new_entry" '.[$s] = $e' <<<"$lineage")"
+
+  _lineage_write "$cell_root" "$new_lineage"
+
+  if [[ "$OUTPUT_MODE" == "pretty" ]] || { [[ "$OUTPUT_MODE" == "auto" ]] && is_tty; }; then
+    info "${C_GREEN}annotated${C_RESET} '$skill' with event '$event_type' at $now"
+  else
+    echo "$event"
+  fi
+}
+
+# opensop lineage <skill>
+#   Print the lineage entry for a skill in the active cell. Returns the
+#   default empty entry if no events have been recorded for that skill yet.
+cmd_lineage() {
+  [[ $# -lt 1 ]] && die "usage: opensop lineage <skill>" "usage_error" \
+                        "name a skill (e.g., opensop lineage publish-linkedin)"
+  local skill="$1"
+
+  local cell_root; cell_root="$(_find_scope_root)"
+  [[ -z "$cell_root" ]] && die "not inside an OpenSOP cell — run 'opensop init' first" "usage_error" \
+                               "or cd into a directory under an existing cell"
+
+  local lineage; lineage="$(_lineage_read "$cell_root")"
+  local entry; entry="$(jq --arg s "$skill" '.[$s] // null' <<<"$lineage")"
+  if [[ "$entry" == "null" ]]; then
+    entry="$(_lineage_default_entry "$skill")"
+  fi
+
+  if [[ "$OUTPUT_MODE" == "pretty" ]] || { [[ "$OUTPUT_MODE" == "auto" ]] && is_tty; }; then
+    local n_events status
+    n_events="$(jq -r '.history | length' <<<"$entry")"
+    status="$(jq -r '.status // ""' <<<"$entry")"
+    [[ -z "$status" ]] && status="(none)"
+
+    info "${C_BOLD}lineage:${C_RESET} $skill"
+    info "  logical_name: $(jq -r '.logical_name' <<<"$entry")"
+    info "  status:       $status"
+    info "  metadata:     $(jq -c '.metadata' <<<"$entry")"
+    info "  forked_from:  $(jq -c '.forked_from' <<<"$entry")"
+    info "  history ($n_events event(s)):"
+    if [[ "$n_events" == "0" ]]; then
+      info "    (none)"
+    else
+      while IFS= read -r line; do info "$line"; done < <(jq -r '.history[] | "    \(.at)  \(.type)  \(.data | tojson)"' <<<"$entry")
+    fi
+  else
+    jq . <<<"$entry"
   fi
 }
 
@@ -461,8 +585,10 @@ ${C_BOLD}LOCAL EXECUTION (--local — internal files, no server)${C_RESET}
   ${C_DIM}⚠ local steps run as shell on this machine — only run process files you trust${C_RESET}
 
 ${C_BOLD}CELLS (v0.6 — fractal addressing)${C_RESET}
-  init [--name N] [--parent PATH]  create .opensop/ in cwd; parent auto-detected if cwd is inside an ancestor cell
-  scope                            print the active cell + ancestor chain (errors when cwd is not inside any cell)
+  init [--name N] [--parent PATH]   create .opensop/ in cwd; parent auto-detected if cwd is inside an ancestor cell
+  scope                             print the active cell + ancestor chain (errors when cwd is not inside any cell)
+  annotate <skill> <type> <json>    append a policy event to the skill's lineage history in the active cell
+  lineage <skill>                   print a skill's lineage entry (status, metadata, history) in the active cell
 
 ${C_BOLD}AUTHORING${C_RESET}
   register <process.yaml>       POST a .sop.yaml to /sop/processes/register
@@ -1724,7 +1850,7 @@ main() {
   # curl is only needed for the remote (server) backend. `runs`/`show` are always
   # local, and any command with --local runs on-machine — none of them need curl.
   case "$cmd" in
-    runs|show|init|scope) ;;
+    runs|show|init|scope|annotate|lineage) ;;
     *) [[ "$LOCAL_MODE" == true ]] || require_curl ;;
   esac
 
@@ -1756,6 +1882,8 @@ main() {
     config)     cmd_config "$@" ;;
     init)       cmd_init "$@" ;;
     scope)      cmd_scope "$@" ;;
+    annotate)   cmd_annotate "$@" ;;
+    lineage)    cmd_lineage "$@" ;;
     *)          die "unknown command '$cmd' — run 'opensop help' for usage" "unknown_command" "run opensop help" ;;
   esac
 }

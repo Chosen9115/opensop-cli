@@ -18,6 +18,16 @@ This project follows [Semantic Versioning](https://semver.org/) and the
   Pure-additive — no existing command behavior changes. Foundation for the
   rest of v0.6 (lineage, per-cell receipts, name resolution across cells,
   fork mechanic, `executor` field).
+- **Lineage primitives (v0.6) — `opensop annotate` and `opensop lineage`.**
+  Substrate-level event log per skill stored in `.opensop/lineage.json` in
+  each cell. `annotate <skill> <event-type> <json>` appends a policy event
+  to the skill's history (creates the lineage entry if it doesn't exist).
+  `lineage <skill>` prints the entry (status, metadata, history) in the
+  active cell, returning an empty default if no events have been recorded.
+  Policy-neutral: the substrate stores `status` (open string), `metadata`
+  (open object), and `history[].type` (open string); it doesn't interpret
+  any of them. This is what evolution policies like mineralization sit on
+  top of to record promotions, demotions, locks, etc.
 
 ---
 

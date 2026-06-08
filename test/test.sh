@@ -140,4 +140,108 @@ grep -q "^name: custom-name$"         "$cells_dir/explicit/.opensop/manifest.yam
 grep -q "^parent: /some/abs/path$"    "$cells_dir/explicit/.opensop/manifest.yaml" || { echo "FAIL: explicit --parent not honored"; exit 1; }
 echo "PASS: init — explicit --name and --parent flags honored"
 
+# --------------------------------------------------------------------------- #
+# Lineage primitives (v0.6): annotate + lineage.
+# --------------------------------------------------------------------------- #
+ln_dir="$OPENSOP_LOCAL_HOME/lineage"
+mkdir -p "$ln_dir/c1"
+( cd "$ln_dir/c1" && "$cli" init --json >/dev/null )
+
+# annotate creates a lineage entry for a previously-unknown skill
+ann_evt="$( cd "$ln_dir/c1" && "$cli" annotate skill-a promote '{"to":"m2"}' --json )"
+[ "$(jq -r '.type' <<<"$ann_evt")" = "promote" ]      || { echo "FAIL: annotate output event.type wrong"; exit 1; }
+[ "$(jq -r '.data.to' <<<"$ann_evt")" = "m2" ]        || { echo "FAIL: annotate output event.data.to wrong"; exit 1; }
+[ -n "$(jq -r '.at' <<<"$ann_evt")" ]                  || { echo "FAIL: annotate output missing .at timestamp"; exit 1; }
+on_disk="$(cat "$ln_dir/c1/.opensop/lineage.json")"
+[ "$(jq -r '."skill-a".logical_name' <<<"$on_disk")" = "skill-a" ]    || { echo "FAIL: skill-a not stored in lineage.json"; exit 1; }
+[ "$(jq -r '."skill-a".history | length' <<<"$on_disk")" = "1" ]      || { echo "FAIL: skill-a should have 1 history event"; exit 1; }
+echo "PASS: annotate — creates lineage entry + appends first event"
+
+# annotate appends to an existing entry (history grows; both events preserved)
+( cd "$ln_dir/c1" && "$cli" annotate skill-a promote '{"to":"m3"}' --json >/dev/null )
+( cd "$ln_dir/c1" && "$cli" annotate skill-a bless   '{"by":"human"}' --json >/dev/null )
+on_disk="$(cat "$ln_dir/c1/.opensop/lineage.json")"
+[ "$(jq -r '."skill-a".history | length' <<<"$on_disk")" = "3" ]        || { echo "FAIL: skill-a should have 3 history events"; exit 1; }
+[ "$(jq -r '."skill-a".history[2].type' <<<"$on_disk")" = "bless" ]     || { echo "FAIL: last event type wrong"; exit 1; }
+[ "$(jq -r '."skill-a".history[0].data.to' <<<"$on_disk")" = "m2" ]     || { echo "FAIL: first event data lost"; exit 1; }
+echo "PASS: annotate — appends to existing entry, preserves order + prior events"
+
+# lineage retrieves the entry (json mode round-trips faithfully)
+lin_json="$( cd "$ln_dir/c1" && "$cli" lineage skill-a --json )"
+[ "$(jq -r '.logical_name'        <<<"$lin_json")" = "skill-a" ] || { echo "FAIL: lineage logical_name wrong"; exit 1; }
+[ "$(jq -r '.history | length'    <<<"$lin_json")" = "3" ]       || { echo "FAIL: lineage history count wrong"; exit 1; }
+[ "$(jq -r '.status'              <<<"$lin_json")" = "" ]        || { echo "FAIL: lineage status should be empty by default"; exit 1; }
+[ "$(jq -r '.forked_from'         <<<"$lin_json")" = "null" ]    || { echo "FAIL: lineage forked_from should be null"; exit 1; }
+echo "PASS: lineage — returns full entry with correct shape"
+
+# lineage on never-annotated skill returns default empty entry (not an error)
+lin_empty="$( cd "$ln_dir/c1" && "$cli" lineage never-touched --json )"
+[ "$(jq -r '.logical_name'     <<<"$lin_empty")" = "never-touched" ] || { echo "FAIL: lineage on unknown skill should still set logical_name"; exit 1; }
+[ "$(jq -r '.history | length' <<<"$lin_empty")" = "0" ]             || { echo "FAIL: lineage on unknown skill should have empty history"; exit 1; }
+echo "PASS: lineage — returns empty default for never-annotated skill"
+
+# negative: invalid JSON data
+set +e
+( cd "$ln_dir/c1" && "$cli" annotate skill-a promote 'this-is-not-json' --json >/dev/null 2>&1 ); arc=$?
+set -e
+[ "$arc" -ne 0 ] || { echo "FAIL: annotate with invalid JSON should exit non-zero"; exit 1; }
+echo "PASS: annotate — rejects invalid JSON data"
+
+# negative: missing args (annotate needs skill + type + data)
+set +e
+( cd "$ln_dir/c1" && "$cli" annotate skill-a --json >/dev/null 2>&1 ); brc=$?
+set -e
+[ "$brc" -ne 0 ] || { echo "FAIL: annotate with missing args should exit non-zero"; exit 1; }
+echo "PASS: annotate — rejects missing args"
+
+# negative: annotate outside any cell
+set +e
+( cd "$OPENSOP_LOCAL_HOME" && "$cli" annotate x y '{}' --json >/dev/null 2>&1 ); crc=$?
+set -e
+[ "$crc" -ne 0 ] || { echo "FAIL: annotate outside any cell should exit non-zero"; exit 1; }
+echo "PASS: annotate — errors when not inside a cell"
+
+# negative: lineage outside any cell
+set +e
+( cd "$OPENSOP_LOCAL_HOME" && "$cli" lineage anything --json >/dev/null 2>&1 ); drc=$?
+set -e
+[ "$drc" -ne 0 ] || { echo "FAIL: lineage outside any cell should exit non-zero"; exit 1; }
+echo "PASS: lineage — errors when not inside a cell"
+
+# corruption guard: bad JSON in lineage.json triggers invalid_json error
+echo "not { valid : json" > "$ln_dir/c1/.opensop/lineage.json"
+set +e
+( cd "$ln_dir/c1" && "$cli" lineage skill-a --json >/dev/null 2>&1 ); erc=$?
+set -e
+[ "$erc" -ne 0 ] || { echo "FAIL: lineage on corrupt lineage.json should exit non-zero"; exit 1; }
+echo "PASS: lineage — refuses to read a corrupt lineage.json"
+
+# --------------------------------------------------------------------------- #
+# --pretty flag overrides auto-mode regardless of TTY (regression for the
+# subshell-capture bug that made cmd_init/scope/annotate/lineage always
+# emit JSON because _resolve_output_mode was called via $() which made
+# is_tty see a pipe instead of the terminal).
+# --------------------------------------------------------------------------- #
+mkdir -p "$cells_dir/pretty-out"
+pretty_init="$( cd "$cells_dir/pretty-out" && "$cli" --pretty init )"
+# Must NOT start with '{' (which would mean JSON output)
+[[ "${pretty_init:0:1}" != "{" ]]                                   || { echo "FAIL: init --pretty produced JSON"; exit 1; }
+[[ "$pretty_init" == *"initialized cell"* ]]                        || { echo "FAIL: init --pretty missing 'initialized cell'"; exit 1; }
+echo "PASS: init --pretty produces prose (not JSON) even from non-TTY caller"
+
+pretty_scope="$( cd "$cells_dir/pretty-out" && "$cli" --pretty scope )"
+[[ "${pretty_scope:0:1}" != "[" ]]                                  || { echo "FAIL: scope --pretty produced JSON array"; exit 1; }
+[[ "$pretty_scope" == *"active cell"* ]]                            || { echo "FAIL: scope --pretty missing 'active cell'"; exit 1; }
+echo "PASS: scope --pretty produces prose (not JSON) even from non-TTY caller"
+
+pretty_ann="$( cd "$cells_dir/pretty-out" && "$cli" --pretty annotate s promote '{"x":1}' )"
+[[ "${pretty_ann:0:1}" != "{" ]]                                    || { echo "FAIL: annotate --pretty produced JSON event"; exit 1; }
+[[ "$pretty_ann" == *"annotated"* ]]                                || { echo "FAIL: annotate --pretty missing 'annotated'"; exit 1; }
+echo "PASS: annotate --pretty produces prose (not JSON) even from non-TTY caller"
+
+pretty_lin="$( cd "$cells_dir/pretty-out" && "$cli" --pretty lineage s )"
+[[ "${pretty_lin:0:1}" != "{" ]]                                    || { echo "FAIL: lineage --pretty produced JSON entry"; exit 1; }
+[[ "$pretty_lin" == *"lineage:"* ]]                                 || { echo "FAIL: lineage --pretty missing 'lineage:' header"; exit 1; }
+echo "PASS: lineage --pretty produces prose (not JSON) even from non-TTY caller"
+
 echo "ALL PASS"

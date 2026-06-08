@@ -347,6 +347,8 @@ POSTs the file to `/sop/processes/register`. On success, prints `registered <nam
 | **Cells (v0.6)** | |
 | `opensop init [--name N] [--parent PATH]` | Create `.opensop/` in cwd; cwd becomes the active cell. Auto-detects parent from ancestor cell when present. |
 | `opensop scope` | Print the active cell + ancestor chain (nearest-first); errors if cwd is not inside a cell |
+| `opensop annotate <skill> <event-type> <json>` | Append a policy event to the skill's lineage history in the active cell. Event type is open-string; data is whatever JSON the policy needs. |
+| `opensop lineage <skill>` | Print a skill's lineage entry (status, metadata, history) in the active cell. Returns the empty default if no events have been recorded yet. |
 | **Admin** | |
 | `opensop instances [--state X] [--process Y]` | Paginated list (`GET /sop/instances`) |
 | **Config** | |
