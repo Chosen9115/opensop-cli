@@ -297,4 +297,69 @@ rid_inner=$(jq -r '.run_id' <<<"$m_inner")
 [ ! -d "$OPENSOP_LOCAL_HOME/nested/outer/.opensop/runs/$rid_inner" ]     || { echo "FAIL: nested inner-cell run receipt leaked to outer"; exit 1; }
 echo "PASS: runs — nested cells route receipts to the innermost cell, not ancestors"
 
+# --------------------------------------------------------------------------- #
+# Name resolution across the cell chain (v0.6 PR 4):
+#   * `opensop list` walks active cell + ancestors, tagging each with [cell-name]
+#   * `opensop run <name>` resolves bare name → processes/<name>.sop.json
+#     nearest-wins; explicit paths still work for backwards compat
+# --------------------------------------------------------------------------- #
+nr_org="$OPENSOP_LOCAL_HOME/nr-org"
+nr_team="$nr_org/team"
+mkdir -p "$nr_team"
+( cd "$nr_org"  && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+( cd "$nr_team" && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+
+# Inline skill at the org level — uses a `shell` step so it has no file deps
+mkdir -p "$nr_org/processes"
+cat > "$nr_org/processes/say-hi.sop.json" <<'JSON'
+{ "name": "say-hi", "inputs": {},
+  "steps": [ { "id": "hi", "type": "shell", "run": "echo hi" } ] }
+JSON
+
+# (1) list from inside team walks up — should find org's say-hi tagged [nr-org]
+list_out=$( cd "$nr_team" && env -u OPENSOP_LOCAL_HOME "$cli" list --local )
+[[ "$list_out" == *"[nr-org]"*"say-hi"* ]] || { echo "FAIL: list inside team didn't surface org's say-hi tagged [nr-org]"; echo "  got: $list_out"; exit 1; }
+echo "PASS: list — inside cell, walks active + ancestor processes/ tagged with [cell-name]"
+
+# (2) list with explicit dir arg uses the original find-based behavior (no [cell] tags)
+explicit_dir_list=$( "$cli" list --local "$nr_org" )
+[[ "$explicit_dir_list" == *"say-hi"* ]]   || { echo "FAIL: explicit-dir list didn't find say-hi"; exit 1; }
+[[ "$explicit_dir_list" != *"[nr-org]"* ]] || { echo "FAIL: explicit-dir list shouldn't add [cell-name] tag (backwards compat)"; exit 1; }
+echo "PASS: list — explicit dir arg uses original find behavior (no cell tag)"
+
+# (3) run by NAME from team resolves to org's say-hi (parent cell)
+m_nr=$( cd "$nr_team" && env -u OPENSOP_LOCAL_HOME "$cli" run say-hi --local --json )
+[ "$(jq -r '.status'       <<<"$m_nr")" = "completed" ]              || { echo "FAIL: name-resolved run didn't complete"; exit 1; }
+[ "$(jq -r '.process_file' <<<"$m_nr")" = "$nr_org/processes/say-hi.sop.json" ] || { echo "FAIL: name resolved to wrong file"; exit 1; }
+echo "PASS: run — bare name resolves to ancestor cell's processes/<name>.sop.json"
+
+# (4) nearest-wins: a same-name skill in team's processes/ shadows org's
+mkdir -p "$nr_team/processes"
+cat > "$nr_team/processes/say-hi.sop.json" <<'JSON'
+{ "name": "say-hi", "inputs": {},
+  "steps": [ { "id": "hi-team", "type": "shell", "run": "echo hi-from-team" } ] }
+JSON
+m_near=$( cd "$nr_team" && env -u OPENSOP_LOCAL_HOME "$cli" run say-hi --local --json )
+[ "$(jq -r '.process_file' <<<"$m_near")" = "$nr_team/processes/say-hi.sop.json" ] || { echo "FAIL: nearest-wins didn't pick team's say-hi"; exit 1; }
+echo "PASS: run — nearest-wins resolution (team's say-hi shadows org's)"
+
+# (5) explicit path still works (backwards compat)
+m_path=$( cd "$nr_team" && env -u OPENSOP_LOCAL_HOME "$cli" run "$nr_org/processes/say-hi.sop.json" --local --json )
+[ "$(jq -r '.process_file' <<<"$m_path")" = "$nr_org/processes/say-hi.sop.json" ] || { echo "FAIL: explicit path not honored"; exit 1; }
+echo "PASS: run — explicit path still works (backwards compat for paths containing / or .sop.json)"
+
+# (6) run by non-existent name errors helpfully
+set +e
+( cd "$nr_team" && env -u OPENSOP_LOCAL_HOME "$cli" run no-such-skill --local --json >/dev/null 2>&1 ); nrrc=$?
+set -e
+[ "$nrrc" -ne 0 ] || { echo "FAIL: run with non-existent name should exit non-zero"; exit 1; }
+echo "PASS: run — non-existent name errors cleanly"
+
+# (7) run by name when NOT in any cell — also errors (nothing to resolve against)
+set +e
+( cd "$OPENSOP_LOCAL_HOME" && env -u OPENSOP_LOCAL_HOME "$cli" run say-hi --local --json >/dev/null 2>&1 ); ncrc=$?
+set -e
+[ "$ncrc" -ne 0 ] || { echo "FAIL: run by name outside any cell should exit non-zero"; exit 1; }
+echo "PASS: run — bare name outside any cell errors (no cell chain to search)"
+
 echo "ALL PASS"
