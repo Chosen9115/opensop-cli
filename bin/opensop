@@ -257,6 +257,173 @@ lookup_name() {
 }
 
 # --------------------------------------------------------------------------- #
+# Cell / scope (v0.6 — fractal addressing)
+#
+# A "cell" is a directory marked by .opensop/manifest.yaml. Cells nest;
+# `init` creates one in cwd, `scope` walks up from cwd to find the nearest
+# cell (the active scope) and prints its ancestor chain.
+#
+# Substrate level only — no policy, no evolution semantics here. The
+# manifest is intentionally tiny (name + parent) so a 6-line grep+sed
+# parser is enough and we don't pull in a yaml dep.
+# --------------------------------------------------------------------------- #
+
+# _find_scope_root [start_dir]
+#   Walk up from start_dir (default: cwd) looking for .opensop/manifest.yaml.
+#   Echo absolute path of the cell root (the directory CONTAINING .opensop/),
+#   or empty string if none. Empty is "no active cell", not an error.
+_find_scope_root() {
+  local d
+  d="$(cd "${1:-.}" 2>/dev/null && pwd)" || return 0
+  while [[ "$d" != "/" && -n "$d" ]]; do
+    if [[ -d "$d/.opensop" && -f "$d/.opensop/manifest.yaml" ]]; then
+      echo "$d"
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+  return 0
+}
+
+# _read_manifest_field <cell_root> <field>
+#   Read a single top-level scalar field from .opensop/manifest.yaml.
+#   Grammar: "field: value" on its own line. Strips quotes + trailing space.
+#   Returns empty for "null" or missing fields.
+_read_manifest_field() {
+  local cell_root="$1" field="$2"
+  local file="$cell_root/.opensop/manifest.yaml"
+  local val
+  [[ -f "$file" ]] || return 0
+  val=$(grep -E "^${field}:" "$file" 2>/dev/null \
+    | head -1 \
+    | sed -E "s/^${field}:[[:space:]]*//; s/^['\"]//; s/['\"]$//; s/[[:space:]]+$//")
+  [[ "$val" == "null" ]] && val=""
+  echo "$val"
+}
+
+# _enumerate_ancestors <cell_root>
+#   Echo nearest-first list of ancestor cell roots, one per line.
+#   Resolves the manifest's `parent` field (relative or absolute), then
+#   continues up the chain until a manifest is missing or parent is null.
+_enumerate_ancestors() {
+  local cell_root="$1"
+  local parent_path
+  while true; do
+    parent_path="$(_read_manifest_field "$cell_root" parent)"
+    [[ -z "$parent_path" ]] && return 0
+    if [[ "$parent_path" != /* ]]; then
+      parent_path="$(cd "$cell_root/$parent_path" 2>/dev/null && pwd)" || return 0
+    fi
+    [[ -d "$parent_path/.opensop" && -f "$parent_path/.opensop/manifest.yaml" ]] || return 0
+    echo "$parent_path"
+    cell_root="$parent_path"
+  done
+}
+
+# opensop init [--name NAME] [--parent PATH]
+#   Create .opensop/ in cwd. The directory becomes the active cell for any
+#   OpenSOP operation executed from within it (or any subdirectory).
+#
+#   Defaults:
+#     --name      cwd basename
+#     --parent    auto-detected by walking up from cwd's parent for an
+#                 ancestor cell; null if none found
+cmd_init() {
+  local name="" parent_arg="" explicit_parent=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)   name="$2"; shift 2 ;;
+      --parent) parent_arg="$2"; explicit_parent=true; shift 2 ;;
+      *) die "unknown flag for init: $1" "unknown_flag" "run opensop help" ;;
+    esac
+  done
+
+  local cwd; cwd="$(pwd)"
+
+  if [[ -d "$cwd/.opensop" ]]; then
+    die "cell already initialized at $cwd/.opensop" "usage_error" \
+        "remove .opensop/ first if you want to re-init, or cd elsewhere"
+  fi
+
+  [[ -z "$name" ]] && name="$(basename "$cwd")"
+
+  local parent_resolved=""
+  if $explicit_parent; then
+    parent_resolved="$parent_arg"
+  else
+    local up; up="$(_find_scope_root "$(dirname "$cwd")")"
+    if [[ -n "$up" ]]; then
+      if [[ "$up" == "$(dirname "$cwd")" ]]; then
+        parent_resolved="../"
+      else
+        parent_resolved="$up"
+      fi
+    fi
+  fi
+
+  mkdir -p "$cwd/.opensop/runs" "$cwd/.opensop/archive"
+  {
+    echo "name: $name"
+    if [[ -n "$parent_resolved" ]]; then
+      echo "parent: $parent_resolved"
+    else
+      echo "parent: null"
+    fi
+  } > "$cwd/.opensop/manifest.yaml"
+  echo "{}" > "$cwd/.opensop/lineage.json"
+
+  if [[ "$(_resolve_output_mode)" == "json" ]]; then
+    jq -nc --arg root "$cwd" --arg name "$name" --arg parent "$parent_resolved" \
+      '{ok:true, cell_root:$root, name:$name, parent:(if $parent == "" then null else $parent end)}'
+  else
+    info "${C_GREEN}initialized cell '$name'${C_RESET} at $cwd/.opensop/"
+    if [[ -n "$parent_resolved" ]]; then
+      info "  parent: $parent_resolved"
+    else
+      info "  parent: (root cell — no ancestor)"
+    fi
+  fi
+}
+
+# opensop scope
+#   Print the active cell + ancestor chain (nearest-first). Fails if cwd is
+#   not inside any cell.
+cmd_scope() {
+  local cell_root; cell_root="$(_find_scope_root)"
+
+  if [[ -z "$cell_root" ]]; then
+    die "not inside an OpenSOP cell — run 'opensop init' to create one" "usage_error" \
+        "or cd into a directory under an existing cell"
+  fi
+
+  local name; name="$(_read_manifest_field "$cell_root" name)"
+
+  if [[ "$(_resolve_output_mode)" == "json" ]]; then
+    local payload
+    payload="$(jq -n --arg name "$name" --arg root "$cell_root" \
+      '[{name:$name, root:$root, active:true}]')"
+    while IFS= read -r ancestor_root; do
+      [[ -z "$ancestor_root" ]] && continue
+      local a_name; a_name="$(_read_manifest_field "$ancestor_root" name)"
+      payload="$(jq --arg name "$a_name" --arg root "$ancestor_root" \
+        '. + [{name:$name, root:$root, active:false}]' <<<"$payload")"
+    done < <(_enumerate_ancestors "$cell_root")
+    echo "$payload"
+  else
+    info "${C_BOLD}active cell:${C_RESET} $name"
+    info "  $cell_root"
+    local printed_header=false
+    while IFS= read -r ancestor_root; do
+      [[ -z "$ancestor_root" ]] && continue
+      $printed_header || { info ""; info "ancestors (nearest first):"; printed_header=true; }
+      local a_name; a_name="$(_read_manifest_field "$ancestor_root" name)"
+      info "  ↑ $a_name"
+      info "    $ancestor_root"
+    done < <(_enumerate_ancestors "$cell_root")
+  fi
+}
+
+# --------------------------------------------------------------------------- #
 # Subcommand: help
 # --------------------------------------------------------------------------- #
 
@@ -292,6 +459,10 @@ ${C_BOLD}LOCAL EXECUTION (--local — internal files, no server)${C_RESET}
   runs                             list local runs
   show <run_id>                    show a local run's manifest + per-step receipts
   ${C_DIM}⚠ local steps run as shell on this machine — only run process files you trust${C_RESET}
+
+${C_BOLD}CELLS (v0.6 — fractal addressing)${C_RESET}
+  init [--name N] [--parent PATH]  create .opensop/ in cwd; parent auto-detected if cwd is inside an ancestor cell
+  scope                            print the active cell + ancestor chain (errors when cwd is not inside any cell)
 
 ${C_BOLD}AUTHORING${C_RESET}
   register <process.yaml>       POST a .sop.yaml to /sop/processes/register
@@ -1553,7 +1724,7 @@ main() {
   # curl is only needed for the remote (server) backend. `runs`/`show` are always
   # local, and any command with --local runs on-machine — none of them need curl.
   case "$cmd" in
-    runs|show) ;;
+    runs|show|init|scope) ;;
     *) [[ "$LOCAL_MODE" == true ]] || require_curl ;;
   esac
 
@@ -1583,6 +1754,8 @@ main() {
     register)   cmd_register "$@" ;;
     instances)  cmd_instances "$@" ;;
     config)     cmd_config "$@" ;;
+    init)       cmd_init "$@" ;;
+    scope)      cmd_scope "$@" ;;
     *)          die "unknown command '$cmd' — run 'opensop help' for usage" "unknown_command" "run opensop help" ;;
   esac
 }

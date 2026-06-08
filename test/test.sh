@@ -82,4 +82,62 @@ set +e; "$cli" run "$empty_proc" --local --json >/dev/null 2>&1; erc=$?; set -e
 [ "$erc" -ne 0 ] || { echo "FAIL: empty-steps process should be rejected"; exit 1; }
 echo "PASS: empty-steps process rejected"
 
+# --------------------------------------------------------------------------- #
+# Cell primitive (v0.6): init + scope.
+# --------------------------------------------------------------------------- #
+cells_dir="$OPENSOP_LOCAL_HOME/cells"
+mkdir -p "$cells_dir/parent/child" "$cells_dir/no-cell"
+
+# init in root cell (no ancestor)
+( cd "$cells_dir/parent" && "$cli" init --json >/dev/null )
+[ -f "$cells_dir/parent/.opensop/manifest.yaml" ] || { echo "FAIL: init didn't create manifest.yaml"; exit 1; }
+[ -d "$cells_dir/parent/.opensop/runs" ]          || { echo "FAIL: init didn't create runs/"; exit 1; }
+[ -d "$cells_dir/parent/.opensop/archive" ]       || { echo "FAIL: init didn't create archive/"; exit 1; }
+[ -f "$cells_dir/parent/.opensop/lineage.json" ]  || { echo "FAIL: init didn't seed lineage.json"; exit 1; }
+grep -q "^name: parent$"  "$cells_dir/parent/.opensop/manifest.yaml" || { echo "FAIL: parent manifest has wrong name"; exit 1; }
+grep -q "^parent: null$"  "$cells_dir/parent/.opensop/manifest.yaml" || { echo "FAIL: root cell should have parent: null"; exit 1; }
+echo "PASS: init — creates .opensop/ tree as root cell"
+
+# init in child auto-detects parent
+( cd "$cells_dir/parent/child" && "$cli" init --json >/dev/null )
+grep -q "^name: child$"     "$cells_dir/parent/child/.opensop/manifest.yaml" || { echo "FAIL: child manifest has wrong name"; exit 1; }
+grep -q "^parent: \.\./$"   "$cells_dir/parent/child/.opensop/manifest.yaml" || { echo "FAIL: child should auto-detect parent as '../'"; exit 1; }
+echo "PASS: init — auto-detects parent cell from ancestor"
+
+# init failure: already initialized
+set +e
+( cd "$cells_dir/parent" && "$cli" init --json >/dev/null 2>&1 ); irc=$?
+set -e
+[ "$irc" -ne 0 ] || { echo "FAIL: re-init of existing cell should exit non-zero"; exit 1; }
+echo "PASS: init — refuses to clobber existing .opensop/"
+
+# scope from inside child: shows child + parent (2 entries)
+scope_json="$( cd "$cells_dir/parent/child" && "$cli" scope --json )"
+[ "$(jq -r '. | length'      <<<"$scope_json")" = "2" ]      || { echo "FAIL: scope from child should have 2 entries"; exit 1; }
+[ "$(jq -r '.[0].name'       <<<"$scope_json")" = "child" ]  || { echo "FAIL: scope[0].name should be 'child'"; exit 1; }
+[ "$(jq -r '.[0].active'     <<<"$scope_json")" = "true" ]   || { echo "FAIL: scope[0] should be active"; exit 1; }
+[ "$(jq -r '.[1].name'       <<<"$scope_json")" = "parent" ] || { echo "FAIL: scope[1].name should be 'parent'"; exit 1; }
+[ "$(jq -r '.[1].active'     <<<"$scope_json")" = "false" ]  || { echo "FAIL: scope[1] should be inactive (ancestor)"; exit 1; }
+echo "PASS: scope — walks ancestor chain from child to parent"
+
+# scope from inside root: shows only root (1 entry)
+scope_root_json="$( cd "$cells_dir/parent" && "$cli" scope --json )"
+[ "$(jq -r '. | length' <<<"$scope_root_json")" = "1" ]       || { echo "FAIL: root cell scope should have 1 entry"; exit 1; }
+[ "$(jq -r '.[0].name'  <<<"$scope_root_json")" = "parent" ]  || { echo "FAIL: root scope[0].name should be 'parent'"; exit 1; }
+echo "PASS: scope — root cell shows only itself"
+
+# scope failure: outside any cell
+set +e
+( cd "$cells_dir/no-cell" && "$cli" scope --json >/dev/null 2>&1 ); src=$?
+set -e
+[ "$src" -ne 0 ] || { echo "FAIL: scope outside any cell should exit non-zero"; exit 1; }
+echo "PASS: scope — errors when not inside a cell"
+
+# explicit --name + --parent
+mkdir -p "$cells_dir/explicit"
+( cd "$cells_dir/explicit" && "$cli" init --name custom-name --parent /some/abs/path --json >/dev/null )
+grep -q "^name: custom-name$"         "$cells_dir/explicit/.opensop/manifest.yaml" || { echo "FAIL: explicit --name not honored"; exit 1; }
+grep -q "^parent: /some/abs/path$"    "$cells_dir/explicit/.opensop/manifest.yaml" || { echo "FAIL: explicit --parent not honored"; exit 1; }
+echo "PASS: init — explicit --name and --parent flags honored"
+
 echo "ALL PASS"
