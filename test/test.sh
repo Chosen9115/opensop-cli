@@ -216,4 +216,32 @@ set -e
 [ "$erc" -ne 0 ] || { echo "FAIL: lineage on corrupt lineage.json should exit non-zero"; exit 1; }
 echo "PASS: lineage — refuses to read a corrupt lineage.json"
 
+# --------------------------------------------------------------------------- #
+# --pretty flag overrides auto-mode regardless of TTY (regression for the
+# subshell-capture bug that made cmd_init/scope/annotate/lineage always
+# emit JSON because _resolve_output_mode was called via $() which made
+# is_tty see a pipe instead of the terminal).
+# --------------------------------------------------------------------------- #
+mkdir -p "$cells_dir/pretty-out"
+pretty_init="$( cd "$cells_dir/pretty-out" && "$cli" --pretty init )"
+# Must NOT start with '{' (which would mean JSON output)
+[[ "${pretty_init:0:1}" != "{" ]]                                   || { echo "FAIL: init --pretty produced JSON"; exit 1; }
+[[ "$pretty_init" == *"initialized cell"* ]]                        || { echo "FAIL: init --pretty missing 'initialized cell'"; exit 1; }
+echo "PASS: init --pretty produces prose (not JSON) even from non-TTY caller"
+
+pretty_scope="$( cd "$cells_dir/pretty-out" && "$cli" --pretty scope )"
+[[ "${pretty_scope:0:1}" != "[" ]]                                  || { echo "FAIL: scope --pretty produced JSON array"; exit 1; }
+[[ "$pretty_scope" == *"active cell"* ]]                            || { echo "FAIL: scope --pretty missing 'active cell'"; exit 1; }
+echo "PASS: scope --pretty produces prose (not JSON) even from non-TTY caller"
+
+pretty_ann="$( cd "$cells_dir/pretty-out" && "$cli" --pretty annotate s promote '{"x":1}' )"
+[[ "${pretty_ann:0:1}" != "{" ]]                                    || { echo "FAIL: annotate --pretty produced JSON event"; exit 1; }
+[[ "$pretty_ann" == *"annotated"* ]]                                || { echo "FAIL: annotate --pretty missing 'annotated'"; exit 1; }
+echo "PASS: annotate --pretty produces prose (not JSON) even from non-TTY caller"
+
+pretty_lin="$( cd "$cells_dir/pretty-out" && "$cli" --pretty lineage s )"
+[[ "${pretty_lin:0:1}" != "{" ]]                                    || { echo "FAIL: lineage --pretty produced JSON entry"; exit 1; }
+[[ "$pretty_lin" == *"lineage:"* ]]                                 || { echo "FAIL: lineage --pretty missing 'lineage:' header"; exit 1; }
+echo "PASS: lineage --pretty produces prose (not JSON) even from non-TTY caller"
+
 echo "ALL PASS"

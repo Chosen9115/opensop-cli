@@ -372,16 +372,16 @@ cmd_init() {
   } > "$cwd/.opensop/manifest.yaml"
   echo "{}" > "$cwd/.opensop/lineage.json"
 
-  if [[ "$(_resolve_output_mode)" == "json" ]]; then
-    jq -nc --arg root "$cwd" --arg name "$name" --arg parent "$parent_resolved" \
-      '{ok:true, cell_root:$root, name:$name, parent:(if $parent == "" then null else $parent end)}'
-  else
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
     info "${C_GREEN}initialized cell '$name'${C_RESET} at $cwd/.opensop/"
     if [[ -n "$parent_resolved" ]]; then
       info "  parent: $parent_resolved"
     else
       info "  parent: (root cell — no ancestor)"
     fi
+  else
+    jq -nc --arg root "$cwd" --arg name "$name" --arg parent "$parent_resolved" \
+      '{ok:true, cell_root:$root, name:$name, parent:(if $parent == "" then null else $parent end)}'
   fi
 }
 
@@ -398,18 +398,7 @@ cmd_scope() {
 
   local name; name="$(_read_manifest_field "$cell_root" name)"
 
-  if [[ "$(_resolve_output_mode)" == "json" ]]; then
-    local payload
-    payload="$(jq -n --arg name "$name" --arg root "$cell_root" \
-      '[{name:$name, root:$root, active:true}]')"
-    while IFS= read -r ancestor_root; do
-      [[ -z "$ancestor_root" ]] && continue
-      local a_name; a_name="$(_read_manifest_field "$ancestor_root" name)"
-      payload="$(jq --arg name "$a_name" --arg root "$ancestor_root" \
-        '. + [{name:$name, root:$root, active:false}]' <<<"$payload")"
-    done < <(_enumerate_ancestors "$cell_root")
-    echo "$payload"
-  else
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
     info "${C_BOLD}active cell:${C_RESET} $name"
     info "  $cell_root"
     local printed_header=false
@@ -420,6 +409,17 @@ cmd_scope() {
       info "  ↑ $a_name"
       info "    $ancestor_root"
     done < <(_enumerate_ancestors "$cell_root")
+  else
+    local payload
+    payload="$(jq -n --arg name "$name" --arg root "$cell_root" \
+      '[{name:$name, root:$root, active:true}]')"
+    while IFS= read -r ancestor_root; do
+      [[ -z "$ancestor_root" ]] && continue
+      local a_name; a_name="$(_read_manifest_field "$ancestor_root" name)"
+      payload="$(jq --arg name "$a_name" --arg root "$ancestor_root" \
+        '. + [{name:$name, root:$root, active:false}]' <<<"$payload")"
+    done < <(_enumerate_ancestors "$cell_root")
+    echo "$payload"
   fi
 }
 
@@ -500,10 +500,10 @@ cmd_annotate() {
 
   _lineage_write "$cell_root" "$new_lineage"
 
-  if [[ "$(_resolve_output_mode)" == "json" ]]; then
-    echo "$event"
-  else
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
     info "${C_GREEN}annotated${C_RESET} '$skill' with event '$event_type' at $now"
+  else
+    echo "$event"
   fi
 }
 
@@ -525,9 +525,7 @@ cmd_lineage() {
     entry="$(_lineage_default_entry "$skill")"
   fi
 
-  if [[ "$(_resolve_output_mode)" == "json" ]]; then
-    jq . <<<"$entry"
-  else
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
     local n_events status
     n_events="$(jq -r '.history | length' <<<"$entry")"
     status="$(jq -r '.status // ""' <<<"$entry")"
@@ -544,6 +542,8 @@ cmd_lineage() {
     else
       while IFS= read -r line; do info "$line"; done < <(jq -r '.history[] | "    \(.at)  \(.type)  \(.data | tojson)"' <<<"$entry")
     fi
+  else
+    jq . <<<"$entry"
   fi
 }
 
