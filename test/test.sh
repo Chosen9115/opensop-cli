@@ -448,4 +448,80 @@ m_resolved=$( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" run greet-skill 
 [ "$(jq -r '.process_file' <<<"$m_resolved")" = "$fk_team/processes/greet-skill.sop.json" ] || { echo "FAIL: name resolution didn't pick child's forked copy"; exit 1; }
 echo "PASS: fork + run — forked skill is nearest-wins for name resolution"
 
+# --------------------------------------------------------------------------- #
+# Executor field (v0.6 PR 6): optional `executor: internal|external` on steps.
+# Field is validated up-front (parse_error on invalid value), defaults per type
+# when absent, and is recorded in each step's audit entry.
+# --------------------------------------------------------------------------- #
+ex_dir="$OPENSOP_LOCAL_HOME/exec"
+mkdir -p "$ex_dir"
+
+# (1) default (no executor) — shell step records executor:external
+cat > "$ex_dir/def.sop.json" <<'JSON'
+{ "name": "def", "inputs": {},
+  "steps": [ { "id": "s1", "type": "shell", "run": "echo ok" } ] }
+JSON
+m_def=$("$cli" run "$ex_dir/def.sop.json" --local --json)
+rid_def=$(jq -r .run_id <<<"$m_def")
+[ "$(jq -r '.executor' "$OPENSOP_LOCAL_HOME/runs/$rid_def/audit.jsonl")" = "external" ] || { echo "FAIL: shell-step default executor should be 'external'"; exit 1; }
+echo "PASS: executor — shell step defaults to external in receipts"
+
+# (2) noop step records executor:internal by default
+cat > "$ex_dir/noop.sop.json" <<'JSON'
+{ "name": "noop-test", "inputs": {},
+  "steps": [ { "id": "s1", "type": "noop" } ] }
+JSON
+m_noop=$("$cli" run "$ex_dir/noop.sop.json" --local --json)
+rid_noop=$(jq -r .run_id <<<"$m_noop")
+[ "$(jq -r '.executor' "$OPENSOP_LOCAL_HOME/runs/$rid_noop/audit.jsonl")" = "internal" ] || { echo "FAIL: noop step default executor should be 'internal'"; exit 1; }
+echo "PASS: executor — noop step defaults to internal in receipts"
+
+# (3) explicit executor: internal honored even on shell step (purely metadata)
+cat > "$ex_dir/exp-int.sop.json" <<'JSON'
+{ "name": "exp-int", "inputs": {},
+  "steps": [ { "id": "s1", "type": "shell", "executor": "internal", "run": "echo ok" } ] }
+JSON
+m_ei=$("$cli" run "$ex_dir/exp-int.sop.json" --local --json)
+rid_ei=$(jq -r .run_id <<<"$m_ei")
+[ "$(jq -r '.executor' "$OPENSOP_LOCAL_HOME/runs/$rid_ei/audit.jsonl")" = "internal" ] || { echo "FAIL: explicit executor:internal not recorded"; exit 1; }
+echo "PASS: executor — explicit 'internal' is honored and recorded"
+
+# (4) explicit executor: external honored
+cat > "$ex_dir/exp-ext.sop.json" <<'JSON'
+{ "name": "exp-ext", "inputs": {},
+  "steps": [ { "id": "s1", "type": "shell", "executor": "external", "run": "echo ok" } ] }
+JSON
+m_ee=$("$cli" run "$ex_dir/exp-ext.sop.json" --local --json)
+rid_ee=$(jq -r .run_id <<<"$m_ee")
+[ "$(jq -r '.executor' "$OPENSOP_LOCAL_HOME/runs/$rid_ee/audit.jsonl")" = "external" ] || { echo "FAIL: explicit executor:external not recorded"; exit 1; }
+echo "PASS: executor — explicit 'external' is honored and recorded"
+
+# (5) invalid executor → parse_error, fails BEFORE any step runs
+cat > "$ex_dir/bad.sop.json" <<'JSON'
+{ "name": "bad", "inputs": {},
+  "steps": [ { "id": "s1", "type": "shell", "executor": "wat", "run": "echo never" } ] }
+JSON
+set +e
+"$cli" run "$ex_dir/bad.sop.json" --local --json >/dev/null 2>&1; bad_rc=$?
+set -e
+[ "$bad_rc" -ne 0 ] || { echo "FAIL: invalid executor should exit non-zero"; exit 1; }
+echo "PASS: executor — invalid value errors with parse_error before any step runs"
+
+# (6) invalid value on a later step — caught up-front, NO run dir created
+cat > "$ex_dir/bad-later.sop.json" <<'JSON'
+{ "name": "bad-later", "inputs": {},
+  "steps": [
+    { "id": "first", "type": "shell", "run": "echo first-ran" },
+    { "id": "second", "type": "shell", "executor": "wrong", "run": "echo never" }
+  ] }
+JSON
+runs_before=$(ls "$OPENSOP_LOCAL_HOME/runs" 2>/dev/null | wc -l | tr -d ' ')
+set +e
+"$cli" run "$ex_dir/bad-later.sop.json" --local --json >/dev/null 2>&1; bl_rc=$?
+set -e
+runs_after=$(ls "$OPENSOP_LOCAL_HOME/runs" 2>/dev/null | wc -l | tr -d ' ')
+[ "$bl_rc" -ne 0 ]                 || { echo "FAIL: bad-later should exit non-zero"; exit 1; }
+[ "$runs_before" = "$runs_after" ] || { echo "FAIL: bad-later created a run dir despite up-front validation"; exit 1; }
+echo "PASS: executor — pre-validates ALL steps before creating a run dir (no partial runs)"
+
 echo "ALL PASS"

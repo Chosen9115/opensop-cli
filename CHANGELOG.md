@@ -11,6 +11,20 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ### Added
 
+- **Step executor field (v0.6) — `executor: internal|external`.** Steps in a
+  `.sop.json` may declare where their work happens: `external` means the work
+  is done by a process outside the OpenSOP runtime (script, webhook); the
+  runtime orchestrates and receives the receipt. `internal` means the runtime
+  handles the step directly. Field is optional; per-type defaults apply when
+  absent (`automated`/`shell`/`webhook` → external, `noop`/`form`/`approval`/
+  `notification`/`wait`/`judgment` → internal). Invalid values fail with
+  `parse_error` at process load time — before any step runs and before a run
+  directory is even created. The effective executor (explicit or defaulted)
+  is recorded in each step's `audit.jsonl` entry. This formalizes the
+  B-mode-vs-A-mode distinction from the v0.6 spec and matches existing
+  production patterns (deterministic external scripts producing typed
+  receipts).
+
 - **Fork mechanic (v0.6) — `opensop fork <name> [--from <cell>]`.** Materializes
   a copy of an ancestor cell's skill into the active cell and records a lineage
   entry with `forked_from = { cell, forked_at, snapshot }`. The `snapshot` is

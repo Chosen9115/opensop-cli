@@ -1836,6 +1836,25 @@ local_run() {
   [ "$n_steps" -lt 0 ] && die "process has no valid \"steps\" array: $proc_file" "parse_error" "add a \"steps\": [ ... ] array"
   [ "$n_steps" -eq 0 ] && die "process has no steps: $proc_file" "parse_error" "add at least one step to \"steps\""
 
+  # v0.6: pre-validate the optional `executor` field on every step before
+  # running anything. Allowed values: "internal" | "external". Field is
+  # optional; per-type defaults apply when absent (automated/shell/webhook
+  # → external; noop/form/approval/notification/wait/judgment → internal).
+  # Invalid values fail loudly here (parse_error) rather than after partial
+  # execution.
+  local _v_i=0
+  while [ "$_v_i" -lt "$n_steps" ]; do
+    local _v_step _v_exec _v_id
+    _v_step="$(jq -c ".steps[$_v_i]" "$proc_file")"
+    _v_exec="$(jq -r '.executor // ""' <<<"$_v_step")"
+    if [[ -n "$_v_exec" && "$_v_exec" != "internal" && "$_v_exec" != "external" ]]; then
+      _v_id="$(jq -r '.id // "?"' <<<"$_v_step")"
+      die "step[$_v_i] '$_v_id' has invalid executor '$_v_exec' (must be 'internal' or 'external')" "parse_error" \
+          "omit the executor field to accept the default, or set it to internal|external"
+    fi
+    _v_i=$((_v_i+1))
+  done
+
   local run_id run_dir audit started
   run_id="$(_local_run_id)"; run_dir="$OPENSOP_LOCAL_HOME/runs/$run_id"
   mkdir -p "$run_dir"; audit="$run_dir/audit.jsonl"; started="$(_local_now)"
@@ -1845,12 +1864,23 @@ local_run() {
 
   local i=0 run_status="completed"
   while [ "$i" -lt "$n_steps" ]; do
-    local step sid stype srun scont
+    local step sid stype srun scont sexec
     step="$(jq -c ".steps[$i]" "$proc_file")"
     sid="$(jq -r '.id' <<<"$step")"; [ "$sid" = null ] && sid="step-$i"
     stype="$(jq -r '.type // "automated"' <<<"$step")"
     srun="$(jq -r '.run // ""' <<<"$step")"
     scont="$(jq -r '.continue_on_error // false' <<<"$step")"
+    # v0.6: resolve executor. Explicit value already validated up-front; here
+    # we apply per-type defaults when absent. The effective value goes into
+    # the audit so receipts record WHERE the work happened.
+    sexec="$(jq -r '.executor // ""' <<<"$step")"
+    if [[ -z "$sexec" ]]; then
+      case "$stype" in
+        automated|shell|webhook)                          sexec="external" ;;
+        noop|form|approval|notification|wait|judgment)    sexec="internal" ;;
+        *)                                                sexec="external" ;;
+      esac
+    fi
 
     # Reset explicitly each iteration — re-`local x` (no `=`) does NOT clear a
     # value already local in this function, which would leak one step into the next.
@@ -1887,9 +1917,9 @@ local_run() {
     local serr=""
     [ -s "$run_dir/$sid.stderr.log" ] && serr="$(cat "$run_dir/$sid.stderr.log")"
     rm -f "$run_dir/$sid.stderr.log"
-    jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg st "$sstatus" --argjson rc "$rc" \
+    jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg ex "$sexec" --arg st "$sstatus" --argjson rc "$rc" \
       --arg a "$s_started" --arg b "$s_ended" --argjson out "$out_json" --arg se "$serr" \
-      '{run_id:$rid, step:$sid, type:$t, status:$st, exit_code:$rc, started_at:$a, ended_at:$b, output:$out}
+      '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:$st, exit_code:$rc, started_at:$a, ended_at:$b, output:$out}
        + (if $se=="" then {} else {stderr:$se} end)' >> "$audit"
 
     if [ "$rc" -eq 0 ]; then
