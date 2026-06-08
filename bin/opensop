@@ -558,6 +558,106 @@ cmd_lineage() {
   fi
 }
 
+# opensop fork <name> [--from <cell-path>]
+#   Materialize a copy of an ancestor cell's skill in the active cell, and
+#   record a lineage entry with the parent's policy state (status, metadata)
+#   captured as a snapshot. After fork:
+#     * processes/<name>.sop.json exists in the active cell (copied verbatim)
+#     * lineage entry has forked_from = { cell, forked_at, snapshot }
+#     * the child's live status + metadata are empty — policy decides what
+#       to do with the snapshot (e.g., inherit + flag as unverified)
+#
+#   Default source: walk ancestors and use the nearest match. Pass --from
+#   to override (resolves relative to the active cell or accepts absolute).
+cmd_fork() {
+  local name="" from_arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) from_arg="$2"; shift 2 ;;
+      --*)    die "unknown flag for fork: $1" "unknown_flag" "run opensop help" ;;
+      *)
+        if [[ -z "$name" ]]; then name="$1"; shift
+        else die "unexpected arg: $1" "usage_error" "usage: opensop fork <name> [--from <cell>]"
+        fi
+        ;;
+    esac
+  done
+  [[ -z "$name" ]] && die "usage: opensop fork <name> [--from <cell-path>]" "usage_error" "name the skill to fork"
+
+  local active_cell; active_cell="$(_find_scope_root)"
+  [[ -z "$active_cell" ]] && die "not inside an OpenSOP cell — run 'opensop init' first" "usage_error" \
+                                "create a cell first, then fork into it"
+
+  # Refuse to overwrite — a fork into an active cell that already has the
+  # skill would silently shadow without recording lineage. Force explicit
+  # action from the user.
+  [[ -f "$active_cell/processes/${name}.sop.json" ]] && \
+    die "skill already exists in active cell: $active_cell/processes/${name}.sop.json" "usage_error" \
+        "remove it first, or fork into a different cell"
+
+  # Resolve source cell + file.
+  local src_cell="" src_file=""
+  if [[ -n "$from_arg" ]]; then
+    if [[ "$from_arg" != /* ]]; then
+      src_cell="$(cd "$active_cell/$from_arg" 2>/dev/null && pwd)" \
+        || die "--from cell not found: $from_arg" "file_not_found" "use an existing cell path"
+    else
+      src_cell="$from_arg"
+    fi
+    [[ -d "$src_cell/.opensop" && -f "$src_cell/.opensop/manifest.yaml" ]] \
+      || die "--from is not a cell: $src_cell" "usage_error" "the path must contain .opensop/manifest.yaml"
+    src_file="$src_cell/processes/${name}.sop.json"
+    [[ -f "$src_file" ]] || die "skill '$name' not found in $src_cell" "file_not_found" "check processes/${name}.sop.json"
+  else
+    while IFS= read -r anc; do
+      [[ -z "$anc" ]] && continue
+      if [[ -f "$anc/processes/${name}.sop.json" ]]; then
+        src_cell="$anc"
+        src_file="$anc/processes/${name}.sop.json"
+        break
+      fi
+    done < <(_enumerate_ancestors "$active_cell")
+    [[ -z "$src_file" ]] && die "skill '$name' not found in any ancestor cell" "file_not_found" \
+                                "use --from to specify a non-ancestor cell"
+  fi
+
+  # Snapshot parent's policy state (status + metadata) — opaque to substrate.
+  local parent_lineage parent_entry snapshot
+  parent_lineage="$(_lineage_read "$src_cell")"
+  parent_entry="$(jq -n --argjson l "$parent_lineage" --arg s "$name" '$l[$s] // null')"
+  if [[ "$parent_entry" == "null" ]]; then
+    snapshot='{"status":"","metadata":{}}'
+  else
+    snapshot="$(jq -c '{status: (.status // ""), metadata: (.metadata // {})}' <<<"$parent_entry")"
+  fi
+
+  # Copy the process file.
+  mkdir -p "$active_cell/processes"
+  cp "$src_file" "$active_cell/processes/${name}.sop.json"
+
+  # Create the child lineage entry with forked_from set.
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local new_entry; new_entry="$(jq -n --arg name "$name" --arg cell "$src_cell" --arg at "$now" --argjson snap "$snapshot" \
+    '{logical_name: $name,
+      forked_from: { cell: $cell, forked_at: $at, snapshot: $snap },
+      history: [],
+      status: "",
+      metadata: {}}')"
+  local child_lineage; child_lineage="$(_lineage_read "$active_cell")"
+  local new_lineage; new_lineage="$(jq --arg n "$name" --argjson e "$new_entry" '.[$n] = $e' <<<"$child_lineage")"
+  _lineage_write "$active_cell" "$new_lineage"
+
+  if [[ "$OUTPUT_MODE" == "pretty" ]] || { [[ "$OUTPUT_MODE" == "auto" ]] && is_tty; }; then
+    info "${C_GREEN}forked${C_RESET} '$name' from ${C_BOLD}$src_cell${C_RESET}"
+    info "  into:     $active_cell/processes/${name}.sop.json"
+    info "  snapshot: $snapshot"
+    info "  ${C_DIM}(child's live status + metadata are empty — policy decides what to do with the snapshot)${C_RESET}"
+  else
+    jq -nc --arg name "$name" --arg src "$src_cell" --arg dst "$active_cell/processes/${name}.sop.json" --argjson snap "$snapshot" \
+      '{ok:true, name:$name, source_cell:$src, dest_file:$dst, snapshot:$snap}'
+  fi
+}
+
 # --------------------------------------------------------------------------- #
 # Subcommand: help
 # --------------------------------------------------------------------------- #
@@ -600,6 +700,7 @@ ${C_BOLD}CELLS (v0.6 — fractal addressing)${C_RESET}
   scope                             print the active cell + ancestor chain (errors when cwd is not inside any cell)
   annotate <skill> <type> <json>    append a policy event to the skill's lineage history in the active cell
   lineage <skill>                   print a skill's lineage entry (status, metadata, history) in the active cell
+  fork <name> [--from <cell>]       copy an ancestor cell's skill into the active cell + record forked_from snapshot
 
 ${C_BOLD}AUTHORING${C_RESET}
   register <process.yaml>       POST a .sop.yaml to /sop/processes/register
@@ -1936,7 +2037,7 @@ main() {
   # curl is only needed for the remote (server) backend. `runs`/`show` are always
   # local, and any command with --local runs on-machine — none of them need curl.
   case "$cmd" in
-    runs|show|init|scope|annotate|lineage) ;;
+    runs|show|init|scope|annotate|lineage|fork) ;;
     *) [[ "$LOCAL_MODE" == true ]] || require_curl ;;
   esac
 
@@ -1970,6 +2071,7 @@ main() {
     scope)      cmd_scope "$@" ;;
     annotate)   cmd_annotate "$@" ;;
     lineage)    cmd_lineage "$@" ;;
+    fork)       cmd_fork "$@" ;;
     *)          die "unknown command '$cmd' — run 'opensop help' for usage" "unknown_command" "run opensop help" ;;
   esac
 }

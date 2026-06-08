@@ -9,6 +9,17 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ## [Unreleased]
 
+### Added
+
+- **Fork mechanic (v0.6) — `opensop fork <name> [--from <cell>]`.** Materializes
+  a copy of an ancestor cell's skill into the active cell and records a lineage
+  entry with `forked_from = { cell, forked_at, snapshot }`. The `snapshot` is
+  the parent's `status` and `metadata` captured opaquely — the substrate stores;
+  evolution policies decide what to do with it (typical: inherit + mark
+  unverified until first run in the child cell). Auto-detects the source via
+  walk-up; pass `--from` to override. Refuses to overwrite an existing skill
+  in the active cell.
+
 ### Changed
 
 - **Name resolution across the cell chain (v0.6).** Two changes to the local
