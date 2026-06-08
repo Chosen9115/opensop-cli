@@ -524,4 +524,42 @@ runs_after=$(ls "$OPENSOP_LOCAL_HOME/runs" 2>/dev/null | wc -l | tr -d ' ')
 [ "$runs_before" = "$runs_after" ] || { echo "FAIL: bad-later created a run dir despite up-front validation"; exit 1; }
 echo "PASS: executor — pre-validates ALL steps before creating a run dir (no partial runs)"
 
+# --------------------------------------------------------------------------- #
+# `opensop list --conflicts` (post-v0.6 polish): when inside a cell, mark
+# the first occurrence of each filename as active and subsequent ones as
+# shadowed by the nearest cell that has it (PATH-style resolution preview).
+# --------------------------------------------------------------------------- #
+cf_org="$OPENSOP_LOCAL_HOME/cf-org"
+cf_team="$cf_org/team"
+mkdir -p "$cf_team"
+( cd "$cf_org"  && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+( cd "$cf_team" && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+
+# Same basename in both cells → team's wins, org's is shadowed
+mkdir -p "$cf_org/processes" "$cf_team/processes"
+echo '{"name":"shared-org","steps":[{"id":"x","type":"shell","run":"echo o"}]}'  > "$cf_org/processes/shared.sop.json"
+echo '{"name":"shared-team","steps":[{"id":"x","type":"shell","run":"echo t"}]}' > "$cf_team/processes/shared.sop.json"
+# Only-org skill (no conflict)
+echo '{"name":"org-unique","steps":[{"id":"x","type":"shell","run":"echo u"}]}' > "$cf_org/processes/org-unique.sop.json"
+
+# Default list — no shadowing markers (backwards compat with PR #9 output)
+plain=$( cd "$cf_team" && env -u OPENSOP_LOCAL_HOME "$cli" list --local )
+[[ "$plain" != *"shadowed"* && "$plain" != *"active"* ]]  || { echo "FAIL: default list shouldn't include shadowing markers"; exit 1; }
+[[ "$plain" == *"[team]"*"shared.sop.json"* ]]            || { echo "FAIL: default list missing team's shared"; exit 1; }
+[[ "$plain" == *"[cf-org]"*"shared.sop.json"* ]]          || { echo "FAIL: default list missing org's shared"; exit 1; }
+echo "PASS: list — default mode (no --conflicts) preserves backwards-compatible output"
+
+# --conflicts mode
+conf=$( cd "$cf_team" && env -u OPENSOP_LOCAL_HOME "$cli" list --local --conflicts )
+[[ "$conf" == *"[team]"*"shared.sop.json"*"← active"* ]]              || { echo "FAIL: --conflicts didn't mark team's shared as active"; exit 1; }
+[[ "$conf" == *"[cf-org]"*"shared.sop.json"*"← shadowed by [team]"* ]] || { echo "FAIL: --conflicts didn't mark org's shared as shadowed by team"; exit 1; }
+[[ "$conf" == *"[cf-org]"*"org-unique.sop.json"*"← active"* ]]         || { echo "FAIL: --conflicts didn't mark org-unique as active"; exit 1; }
+echo "PASS: list --conflicts — marks shadowed entries with the nearest cell that owns them"
+
+# Explicit dir arg with --conflicts: dir wins (cell-aware mode is skipped), --conflicts is benign
+dir_out=$( "$cli" list --local "$cf_org" --conflicts 2>&1 )
+[[ "$dir_out" == *"shared.sop.json"* ]] || { echo "FAIL: list with explicit dir + --conflicts dropped output"; exit 1; }
+[[ "$dir_out" != *"shadowed"* ]]        || { echo "FAIL: explicit-dir list should not produce shadowing markers"; exit 1; }
+echo "PASS: list — --conflicts with explicit dir arg is benign (no cell chain to compare)"
+
 echo "ALL PASS"

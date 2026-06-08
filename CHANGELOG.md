@@ -9,6 +9,14 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ## [Unreleased]
 
+### Added
+
+- **`opensop list --local --conflicts`.** Inside a cell, marks the first
+  occurrence of each filename across the cell chain as `← active` and
+  subsequent ones as `← shadowed by [cell-name]`. Same data as plain
+  `list` — just annotated with PATH-style resolution preview. Deferred
+  from v0.6 PR #9; lands here as post-release polish.
+
 ## [0.6.0] — 2026-06-08
 
 The cell substrate. Six PRs (#6, #7, #8, #9, #10, #11) added a fractal

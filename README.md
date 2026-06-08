@@ -350,6 +350,7 @@ POSTs the file to `/sop/processes/register`. On success, prints `registered <nam
 | `opensop annotate <skill> <event-type> <json>` | Append a policy event to the skill's lineage history in the active cell. Event type is open-string; data is whatever JSON the policy needs. |
 | `opensop lineage <skill>` | Print a skill's lineage entry (status, metadata, history) in the active cell. Returns the empty default if no events have been recorded yet. |
 | `opensop fork <name> [--from <cell>]` | Materialize an ancestor cell's skill in the active cell. Copies `processes/<name>.sop.json` over, then records a lineage entry with `forked_from = {cell, forked_at, snapshot}` where `snapshot` captures the parent's `status` and `metadata`. Child's live status + metadata start empty (policy decides what to do with the snapshot). Refuses to overwrite an existing skill. |
+| `opensop list --local --conflicts` | Inside a cell, walk the chain and **mark shadowed entries**. The first occurrence of each filename (nearest cell that has it) is tagged `← active`; subsequent occurrences in ancestors are tagged `← shadowed by [cell-name]`. |
 | **Admin** | |
 | `opensop instances [--state X] [--process Y]` | Paginated list (`GET /sop/instances`) |
 | **Config** | |
