@@ -32,7 +32,9 @@ If a process fits the task at hand, prefer running it over re-deriving the steps
   opensop run <name> --input key=value --input key2=value2
 
 Then `opensop status <instance-id>` until it reaches `completed`. If a step is
-`waiting` (form / judgment / approval), advance it with `opensop submit <id> <step-id>`.
+`waiting` (form / judgment / approval), advance it with:
+
+  opensop submit <id> <step-id> --output key=value
 
 This gives the work persistence and a receipt — better than ad-hoc execution.
 ```
@@ -125,11 +127,74 @@ Every run has a queryable history. If something failed, the agent can `opensop s
 5. Identify your first real candidate for mineralization — a 3+ step task you do at least weekly
 6. Author the `.sop.yaml`, register it on your server, run it via the CLI from then on
 
+## Local execution — running processes without a server
+
+Since v0.5, the CLI has a `--local` backend that runs the same process files on-machine — no Rails app, no daemon, no `curl`. As of v0.7, the local backend supports all production step types.
+
+### When to use `--local`
+
+Use the local backend when the agent:
+
+- Is operating in a CI / air-gapped / edge environment with no OpenSOP server
+- Is developing or testing a new process file before registering it on a server
+- Needs lightweight one-off execution and the overhead of a running server is not justified
+
+For persistent audit trails shared across agents or humans, prefer the server backend.
+
+### Pause/resume lifecycle
+
+Some step types pause the run and wait for external input:
+
+| Step type | Pause reason | How to resume |
+|---|---|---|
+| `form` | `waiting_for_input` | `opensop submit <run_id> <step-id> --local --output k=v` |
+| `approval` | `waiting_for_approval` | `opensop submit <run_id> <step-id> --local --output decision=approve` |
+| `wait` (with `until:`) | `waiting_for_callback` | `opensop submit <run_id> <step-id> --local` |
+| `webhook` (callback mode) | `waiting_for_callback` | `opensop submit <run_id> <step-id> --local --output k=v` |
+| `subprocess` | propagates child pause | resume the child, then the parent continues |
+
+When paused, `manifest.status` is `waiting` and `manifest.waiting` records the step, reason, and expected outputs. Execution resumes at `cursor.next_index` — never re-runs completed steps.
+
+### Capability matrix (local backend, v0.7)
+
+| Step type | Local support | Notes |
+|---|---|---|
+| `automated` / `shell` | Full | Runs any shell script |
+| `noop` | Full | Pass-through |
+| `form` | Full | Pause/resume |
+| `approval` | Full | Pause/resume; default `decision` enum |
+| `wait` | Full | `wait.seconds` immediate; `wait.until` pauses |
+| `llm` | Full | Requires `ANTHROPIC_API_KEY` + outbound HTTPS |
+| `webhook` | Sync + callback | Poll mode not yet implemented |
+| `subprocess` | Full | Recursive; depth-guarded (max 16) |
+| `judgment` | Not implemented | Use server runtime |
+| `notification` | Not implemented | Use server runtime |
+
+### CLAUDE.md snippet for local-mode agents
+
+```markdown
+## Running processes locally (no server)
+
+Use `--local` when there is no OpenSOP server available or when testing a new
+process file before registering it.
+
+  opensop run ./my-process.sop.json --local --input key=value
+
+If the process has a `form`, `approval`, or `wait` step, the run pauses. Resume with:
+
+  opensop submit <run_id> <step-id> --local --output key=value
+
+Check `opensop runs` to see all local runs. `opensop show <run_id>` shows the
+manifest + per-step receipts for a specific run.
+
+`llm` steps require `ANTHROPIC_API_KEY` in the environment.
+```
+
 ## Why bash and not a Go binary?
 
 This CLI is intentionally a bash script:
 
-- An agent can `cat /usr/local/bin/opensop` and read all 600 lines in seconds
+- An agent can `cat /usr/local/bin/opensop` and read it in seconds
 - No build step means PRs land in minutes, not days
 - HTTP wrapping is what bash + `curl` + `jq` are *for*
 - If it grows past the point where bash is the right choice, porting to Go is a weekend, not a rewrite
