@@ -1737,6 +1737,7 @@ cmd_schema_validate() {
     else
       local known_types='["form","automated","judgment","approval","webhook","notification","subprocess","loop","llm","wait"]'
       # Each step: must have id + type; type must be known.
+      # Webhook steps additionally require response_mode (no silent default).
       local bad_steps
       bad_steps=$(echo "$doc" | jq -r \
         --argjson known "$known_types" '
@@ -1747,6 +1748,9 @@ cmd_schema_validate() {
           (if $s.type == null then "  step[\($e.key)]: missing type" else "" end),
           (if $s.type != null and ([$known[] | . == $s.type] | any | not) then
             "  step \($s.id // $e.key): unknown type \"\($s.type)\" (valid: \($known | join(", ")))"
+          else "" end),
+          (if $s.type == "webhook" and (($s.webhook.response_mode // "") == "") then
+            "  step \($s.id // $e.key): webhook step is missing required field: webhook.response_mode (sync|callback|poll)"
           else "" end)
         ) | select(length > 0)
       ')
@@ -2317,15 +2321,23 @@ $llm_rendered_prompt"
         local wh_ok=true wh_block wh_url wh_method wh_mode wh_headers wh_body
         wh_block="$(jq -c '.webhook // {}' <<<"$step")"
 
-        # Resolve method (default POST) and mode (default sync).
+        # Resolve method (default POST).
         wh_method="$(jq -r '.method // "POST"' <<<"$wh_block")"
-        wh_mode="$(jq -r '.response_mode // "sync"' <<<"$wh_block")"
+
+        # response_mode is REQUIRED — no silent default. Fail the step loudly
+        # when absent (matches the runtime change landing in parallel).
+        wh_mode="$(jq -r '.response_mode // ""' <<<"$wh_block")"
+        if [[ -z "$wh_mode" ]]; then
+          out_raw='{"error":"webhook.response_mode is required (sync|callback|poll) — no silent default"}'; rc=1; wh_ok=false
+        fi
 
         # Validate mode.
-        case "$wh_mode" in
-          sync|callback|poll) ;;
-          *) out_raw="{\"error\":\"unknown response_mode: $wh_mode (must be sync, callback, or poll)\"}"; rc=1; wh_ok=false ;;
-        esac
+        if [[ "$wh_ok" == true ]]; then
+          case "$wh_mode" in
+            sync|callback|poll) ;;
+            *) out_raw="{\"error\":\"unknown response_mode: $wh_mode (must be sync, callback, or poll)\"}"; rc=1; wh_ok=false ;;
+          esac
+        fi
 
         # poll is not implemented (matches runtime's StepFailure).
         if [[ "$wh_ok" == true && "$wh_mode" == "poll" ]]; then
@@ -2372,8 +2384,15 @@ $llm_rendered_prompt"
               if   $e == "callback_url"              then $cb_url
               elif $e | startswith("env.")           then (env[($e | ltrimstr("env."))] // ("__MISSING_ENV__:" + $e))
               elif $e | startswith("process.inputs.") then
-                   # Resolve from the run initial inputs, not from flat ctx.
-                   (($proc_inp[($e | ltrimstr("process.inputs."))])
+                   # Reduce-walk the dot-path into wh_proc_inputs, matching
+                   # Templating.walk() — so ${process.inputs.address.city}
+                   # descends nested objects, not just a single flat key.
+                   (reduce ($e | ltrimstr("process.inputs.") | split("."))[] as $k (
+                     $proc_inp;
+                     if . == null then null
+                     elif type == "object" then .[$k]
+                     elif type == "array"  then .[ ($k | tonumber? // -1) ]
+                     else null end)
                     | if . == null then ("__MISSING__:" + $e) else tostring end)
               elif $e | startswith("payload.")       then
                    # No inbound payload in local non-trigger runs → always missing.
@@ -2468,70 +2487,118 @@ $llm_rendered_prompt"
               wh_body="$(_wh_render "$wh_tmpl_raw" "$wh_cb_id")"
             fi
           else
-            # No template: send ONLY the step's declared inputs[] resolved against
-            # the current context, or {} if none declared. Mirrors webhook.rb
-            # build_body which sends step.inputs — not the whole accumulated context.
+            # No template: send ONLY the step's declared inputs[] resolved via
+            # their `from:` reference against the current context, or {} if none
+            # declared. Mirrors webhook.rb build_body + InputResolver (step.inputs).
             # Sending the whole ctx would leak prior step outputs to external URLs.
-            local wh_step_input_names
-            wh_step_input_names="$(jq -c '[(.inputs // [])[]?.name // empty]' <<<"$step")"
-            wh_body="$(jq -c --argjson ctx "$ctx" --argjson names "$wh_step_input_names" '
-              $names | map(. as $n | {key: $n, value: ($ctx[$n] // null)}) | from_entries
-              | with_entries(select(.value != null))
-            ' <<<"$step")"
+            #
+            # Resolution rules (matching InputResolver.resolve_reference):
+            #   from: steps.<id>.outputs.<field> → ctx["<id>"]["<field>"]
+            #   from: process.inputs.<field>      → wh_proc_inputs["<field>"]
+            #   no `from` key                     → bare name lookup in ctx
+            wh_body="$(jq -c \
+              --argjson ctx "$ctx" \
+              --argjson proc_inp "$wh_proc_inputs" \
+              '(.inputs // []) |
+               if length == 0 then {}
+               else
+                 map(
+                   select(.name != null) |
+                   . as $inp |
+                   (.from // null) as $from |
+                   # Resolve value from `from:` reference or bare name.
+                   ($from |
+                     if . == null then $ctx[$inp.name]
+                     elif startswith("steps.") and (split(".") | length >= 4) then
+                       # steps.<id>.outputs.<field>
+                       (split(".")) as $parts |
+                       $ctx[$parts[1]][$parts[3]]
+                     elif startswith("process.inputs.") then
+                       reduce (ltrimstr("process.inputs.") | split("."))[] as $k (
+                         $proc_inp;
+                         if . == null then null
+                         elif type == "object" then .[$k]
+                         elif type == "array"  then .[ ($k | tonumber? // -1) ]
+                         else null end)
+                     else
+                       $ctx[$from]
+                     end) as $val |
+                   {key: $inp.name, value: $val}
+                 ) |
+                 from_entries |
+                 with_entries(select(.value != null))
+               end
+              ' <<<"$step")"
           fi
         fi
 
-        # Dispatch: sync fires curl now; callback pauses.
+        # _wh_fire_http: shared curl dispatch used by both sync and callback arms.
+        # Fires the outbound request; sets wh_resp_code and wh_resp_body.
+        # Sets wh_ok=false + out_raw + rc=1 on network or non-existent curl failure.
+        # Does NOT check the HTTP status code — callers do that (sync vs callback
+        # have different 2xx semantics).
+        _wh_fire_http() {
+          require_curl
+          local wh_resp_code="" wh_resp_body=""
+          if [[ -n "${OSL_WEBHOOK_STUB:-}" ]]; then
+            wh_resp_code="${OSL_WEBHOOK_STUB%%:*}"
+            wh_resp_body="${OSL_WEBHOOK_STUB#*:}"
+          else
+            # Real curl call.
+            local wh_curl_tmp; wh_curl_tmp="$(mktemp)"
+            local wh_curl_args=(-sS -X "$wh_method" "$wh_url"
+              -o "$wh_curl_tmp" -w "%{http_code}")
+
+            # Inject headers.
+            local wh_hdr_n; wh_hdr_n="$(jq 'length' <<<"$wh_headers_json")"
+            local wh_h_i=0
+            while [[ "$wh_h_i" -lt "$wh_hdr_n" ]]; do
+              local wh_h_k wh_h_v
+              wh_h_k="$(jq -r "keys_unsorted[$wh_h_i]" <<<"$wh_headers_json")"
+              # [MEDIUM/SECURITY] CRLF guard on header key at dispatch time.
+              # Keys already passed the render-loop guard above; this is a
+              # belt-and-suspenders check in case wh_headers_json was built
+              # from an alternate path in the future.
+              if [[ "$wh_h_k" == *$'\r'* || "$wh_h_k" == *$'\n'* ]]; then
+                out_raw='{"error":"security: CRLF characters in header key name — refusing to send"}'; rc=1; wh_ok=false; return
+              fi
+              wh_h_v="$(jq -r --arg k "$wh_h_k" '.[$k]' <<<"$wh_headers_json")"
+              wh_curl_args+=(-H "$wh_h_k: $wh_h_v")
+              wh_h_i=$(( wh_h_i + 1 ))
+            done
+
+            # Body (not for GET/DELETE).
+            case "$wh_method" in
+              GET|DELETE) ;;
+              *)          wh_curl_args+=(--data-raw "$wh_body") ;;
+            esac
+
+            if ! wh_resp_code="$(curl "${wh_curl_args[@]}" 2>>"$run_dir/$sid.stderr.log")"; then
+              rm -f "$wh_curl_tmp"
+              out_raw='{"error":"curl failed for webhook step"}'; rc=1; wh_ok=false; return
+            fi
+            wh_resp_body="$(cat "$wh_curl_tmp")"; rm -f "$wh_curl_tmp"
+          fi
+          # Export to caller via upvar (bash variable already in scope).
+          # Relies on the fact that wh_resp_code/wh_resp_body are local in _local_step_loop.
+          # shellcheck disable=SC2034
+          WH_FIRE_CODE="$wh_resp_code"
+          WH_FIRE_BODY="$wh_resp_body"
+        }
+
+        # Dispatch: sync fires curl and returns the parsed response; callback
+        # fires curl first (notify the third party with the pre-generated
+        # callback_id in url/headers/body), checks 2xx, THEN pauses.
+        # Mirrors execute_callback in webhook.rb which calls fire_request before
+        # setting state=waiting_for_callback.
         if [[ "$wh_ok" == true ]]; then
           case "$wh_mode" in
             sync)
               # require_curl inside this arm only (curl-free for other types).
-              require_curl
-
-              # Test seam: OSL_WEBHOOK_STUB="<code>:<body>" skips the real call.
-              local wh_resp_code="" wh_resp_body=""
-              if [[ -n "${OSL_WEBHOOK_STUB:-}" ]]; then
-                wh_resp_code="${OSL_WEBHOOK_STUB%%:*}"
-                wh_resp_body="${OSL_WEBHOOK_STUB#*:}"
-              else
-                # Real curl call.
-                local wh_curl_tmp; wh_curl_tmp="$(mktemp)"
-                local wh_curl_args=(-sS -X "$wh_method" "$wh_url"
-                  -o "$wh_curl_tmp" -w "%{http_code}")
-
-                # Inject headers.
-                local wh_hdr_n; wh_hdr_n="$(jq 'length' <<<"$wh_headers_json")"
-                local wh_h_i=0
-                while [[ "$wh_h_i" -lt "$wh_hdr_n" ]]; do
-                  local wh_h_k wh_h_v
-                  wh_h_k="$(jq -r "keys_unsorted[$wh_h_i]" <<<"$wh_headers_json")"
-                  # [MEDIUM/SECURITY] CRLF guard on header key at dispatch time.
-                  # Keys already passed the render-loop guard above; this is a
-                  # belt-and-suspenders check in case wh_headers_json was built
-                  # from an alternate path in the future.
-                  if [[ "$wh_h_k" == *$'\r'* || "$wh_h_k" == *$'\n'* ]]; then
-                    out_raw='{"error":"security: CRLF characters in header key name — refusing to send"}'; rc=1; wh_ok=false; break
-                  fi
-                  wh_h_v="$(jq -r --arg k "$wh_h_k" '.[$k]' <<<"$wh_headers_json")"
-                  wh_curl_args+=(-H "$wh_h_k: $wh_h_v")
-                  wh_h_i=$(( wh_h_i + 1 ))
-                done
-
-                # Body (not for GET/DELETE).
-                case "$wh_method" in
-                  GET|DELETE) ;;
-                  *)          wh_curl_args+=(--data-raw "$wh_body") ;;
-                esac
-
-                if ! wh_resp_code="$(curl "${wh_curl_args[@]}" 2>>"$run_dir/$sid.stderr.log")"; then
-                  rm -f "$wh_curl_tmp"
-                  out_raw='{"error":"curl failed for webhook step"}'; rc=1; wh_ok=false
-                else
-                  wh_resp_body="$(cat "$wh_curl_tmp")"; rm -f "$wh_curl_tmp"
-                fi
-              fi
-
+              local WH_FIRE_CODE="" WH_FIRE_BODY=""
+              _wh_fire_http
               if [[ "$wh_ok" == true ]]; then
+                local wh_resp_code="$WH_FIRE_CODE" wh_resp_body="$WH_FIRE_BODY"
                 # 2xx check (matches raise_unless_success!).
                 if [[ "$wh_resp_code" -lt 200 || "$wh_resp_code" -ge 300 ]]; then
                   local wh_trunc; wh_trunc="${wh_resp_body:0:300}"
@@ -2553,19 +2620,33 @@ $llm_rendered_prompt"
               fi ;;
 
             callback)
-              # Callback mode: pause the run. The callback id was already generated
-              # above (wh_cb_id) so ${callback_url} in url/headers/body resolved to
-              # a real non-empty id. Store it in the waiting block so the caller can
-              # resume via: opensop submit <run_id> <step-id> --local --output k=v ...
+              # Callback mode: FIRE the outbound request first (notify the third
+              # party that work is queued, with ${callback_url} in the payload),
+              # check 2xx, THEN write the waiting receipt and pause.
+              # Mirrors execute_callback (webhook.rb): fire_request → raise_unless_success!
+              # → { waiting: "waiting_for_callback" }.
               # NOTE: there is no inbound HTTP receiver in the local backend — the
-              # third party cannot post to us. The operator resumes manually.
-              # This is intentional and documented: the local engine is not a server.
-              jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg ex "$sexec" \
-                     --arg a "$s_started" --arg cb "$wh_cb_id" \
-                '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:"waiting",
-                  reason:"waiting_for_callback", callback_id:$cb, started_at:$a}' >> "$audit"
-              echo "waiting:$i"
-              return 0 ;;
+              # third party cannot post back to us. The operator resumes manually via
+              # `opensop submit <run_id> <step-id> --local`.
+              local WH_FIRE_CODE="" WH_FIRE_BODY=""
+              _wh_fire_http
+              if [[ "$wh_ok" == true ]]; then
+                local wh_cb_resp_code="$WH_FIRE_CODE" wh_cb_resp_body="$WH_FIRE_BODY"
+                # 2xx check: callback fires must also succeed (matches raise_unless_success!).
+                if [[ "$wh_cb_resp_code" -lt 200 || "$wh_cb_resp_code" -ge 300 ]]; then
+                  local wh_cb_trunc; wh_cb_trunc="${wh_cb_resp_body:0:300}"
+                  out_raw="{\"error\":\"callback webhook outbound HTTP $wh_cb_resp_code: $wh_cb_trunc\"}"; rc=1; wh_ok=false
+                fi
+              fi
+              if [[ "$wh_ok" == true ]]; then
+                # Outbound request succeeded — now pause.
+                jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg ex "$sexec" \
+                       --arg a "$s_started" --arg cb "$wh_cb_id" \
+                  '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:"waiting",
+                    reason:"waiting_for_callback", callback_id:$cb, started_at:$a}' >> "$audit"
+                echo "waiting:$i"
+                return 0
+              fi ;;
           esac
         fi ;;
       subprocess)
