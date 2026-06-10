@@ -9,13 +9,173 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] — unreleased
+
 ### Added
+
+- **`subprocess` step type — recursive local execution (U8).**
+  The CLI exceeds the runtime here: the runtime only stubs subprocess (`StepExecutors::Subprocess`
+  returns `waiting_for_callback`), but the local engine fully executes child processes. Fields:
+  `process` (required — logical name resolved via `_find_skill_in_cells`, or an explicit path);
+  `inputs[]` (optional array of `{name, from}` mappings resolved against the parent context —
+  supports `steps.<id>.outputs.<field>`, `<stepid>.<field>` shorthand, bare context keys, and
+  literal string fallback). Child runs are stored flat at `$OPENSOP_LOCAL_HOME/runs/<child_run_id>/`
+  (same as top-level runs) to prevent exponentially growing paths from recursive processes; a
+  symlink `<parent_run>/subprocess/<step-id>/<child_run_id>` is created for at-a-glance
+  inspectability. Recursion depth is guarded by `OSL_DEPTH` (max 16): each subprocess arm
+  increments the counter and refuses at `>= 16`, turning a self-referencing process into a
+  `failed` receipt rather than an infinite loop or path explosion. Result mapping: child
+  `completed` → the child's final `context.json` is merged into the parent context under the
+  step id (all child step outputs accessible via `parent_ctx[step_id][child_step_id]`); child
+  `waiting` → propagates as parent `waiting_for_callback` with `child_run_id` and `child_run_dir`
+  recorded in the audit receipt for per-level resume; child `failed` → parent step fails
+  (respects `continue_on_error`). `executor` defaults to `internal`. 10 new assertions covering:
+  happy path (parent calls 1-step child, context merged), inspectable run dir, audit receipt
+  (type=subprocess/executor=internal), 'after' step sees child output; failure paths: missing
+  process file, missing 'process' field, failing child halts parent, depth guard rejects
+  self-referencing process, `continue_on_error` lets parent complete despite failing child.
+
+- **`opensop submit <run_id> <step-id> --local` — resume a paused run (U3).**
+  Completes the local state machine. `cmd_submit` branches to `local_submit` when
+  `LOCAL_MODE=true`. `local_submit` asserts the run is `waiting` on the named step,
+  validates submitted outputs against `manifest.waiting.expects.schema` (required /
+  type / enum checks — same logic as the dry-run validator), injects outputs into
+  `context.json` under the step id, appends a `"completed"` receipt to
+  `audit.jsonl` (includes `decided_by` when `--decided-by` is passed), flips
+  manifest back to `"running"`, then re-enters `_local_step_loop` at
+  `cursor.next_index` (the step after the pause point — never re-runs completed
+  steps). Finalizes manifest on completion, failure, or a second pause. Exits 0 on
+  completion; non-zero on failure. Does not require curl — the full
+  form/noop/automated path works with jq only.
+
+- **`form` step type — pause/resume state machine (U2).**
+  A `form` step pauses the local run: `_local_step_loop` appends a `"waiting"`
+  receipt to `audit.jsonl` (reason: `"waiting_for_input"`, byte-parity with the
+  runtime's `StepExecutors::Form`) and returns `"waiting:<index>"`. `local_run`
+  transitions the manifest to `status:"waiting"` and writes the full pause
+  envelope: `cursor:{next_index}` and `waiting:{step, index, reason, expects,
+  since}`. `expects.outputs` lists field names; `expects.schema` carries the full
+  inputs array. No `ended_at` is written while waiting. The run exits 0 (a clean
+  pause is not a failure). A TTY prints the resume hint:
+  `opensop submit <run_id> <step-id> --local --output k=v`.
+  The `_local_finalize_trap` already gates on `status=="running"` so a waiting
+  manifest is never flipped to `"interrupted"` on EXIT. Prerequisite for U3
+  (resume at cursor).
 
 - **`opensop list --local --conflicts`.** Inside a cell, marks the first
   occurrence of each filename across the cell chain as `← active` and
   subsequent ones as `← shadowed by [cell-name]`. Same data as plain
   `list` — just annotated with PATH-style resolution preview. Deferred
   from v0.6 PR #9; lands here as post-release polish.
+
+- **`webhook` step type — outbound HTTP with sync/callback modes (U7).**
+  Mirrors `StepExecutors::Webhook` (`webhook.rb`) + `Opensop::Templating` (`${...}`
+  dialect). Fields inside the nested `webhook:` block: `url` (required), `method`
+  (default `POST`; `GET|POST|PUT|PATCH|DELETE`), `headers` (object), `body_template`
+  (path relative to the `.sop.json` directory; else inputs-as-JSON), `response_mode`
+  (`sync|callback|poll`). Template dialect: `${env.X}`, `${process.inputs.X}`,
+  `${callback_url}`, bare `${X.Y.Z}` (→ accumulated context). Implemented in pure jq
+  (no shell eval, no external renderer). **sync mode**: `require_curl` inside this arm
+  only; fires a real curl call (or the `OSL_WEBHOOK_STUB` seam); asserts 2xx (else step
+  fails); parses the response body as a JSON object into step outputs (empty body → `{}`);
+  non-JSON body is a step failure. **callback mode**: appends a `waiting` audit receipt
+  (`reason: "waiting_for_callback"`, `callback_id` included for tracing), then pauses
+  the run via the same `waiting:<index>` protocol as `form`/`approval`/`wait.until`;
+  operator resumes manually with `opensop submit <run_id> <step-id> --local --output k=v`
+  (no inbound HTTP receiver — documented limitation of the local backend). **poll mode**:
+  exits 2 with `"response_mode: poll is not implemented yet (see SPEC §8 roadmap)"`
+  (byte-parity with the runtime's `raise StepFailure`). `executor` defaults to
+  `external` (already in the per-type default map). Test seam: `OSL_WEBHOOK_STUB=
+  "<code>:<body>"` (e.g. `OSL_WEBHOOK_STUB='200:{"result":"ok"}'`) skips curl and
+  drives the full 2xx/non-2xx/parse pipeline without a real server. 20 new assertions
+  covering: sync 2xx success, context threading, audit receipt, executor=external,
+  sync non-2xx failure, empty body, non-JSON body, callback pause, waiting.reason,
+  callback resume via submit, 'done' step after resume, poll rejection, missing url.
+
+- **`llm` step type — synchronous LLM call via Anthropic Claude (U6).**
+  Mirrors `StepExecutors::Llm` + `LlmProviders::Anthropic` exactly. Pipeline:
+  (1) load prompt (inline `prompt:` or `prompt_file:` relative to the `.sop.json`
+  directory); (2) substitute `{{ var }}` tokens from the accumulated context via
+  jq; (3) POST to `https://api.anthropic.com/v1/messages` (headers:
+  `x-api-key`, `anthropic-version: 2023-06-01`, `content-type`) with `model`,
+  `max_tokens: 4096`, a schema-instructed `system` prompt, and the rendered user
+  prompt; (4) extract the first text content block, strip `` ```json `` fences,
+  parse as a JSON object; (5) validate against `expected_output_schema` (required
+  / type / enum checks); (6) on validation failure, retry up to
+  `max_retries + 1` total attempts (default 3) with a corrective preamble — or 1
+  attempt when `retry_on_incomplete: false`. On success, the validated object is
+  the step output and is threaded into context. On exhaustion, `manifest.status`
+  is `"failed"`. `require_curl` is called inside this arm only (curl-free for all
+  other step types). `ANTHROPIC_API_KEY` absence is a loud fatal error (parity
+  with `LlmProviders::Anthropic#call`). Model must start with `"claude"` (parity
+  with `Llm.default_provider_for`). Test seam: `OSL_LLM_STUB=<raw-text>` skips
+  the network call and feeds the value directly into the fence-strip + schema
+  validation pipeline (parity with `provider_resolver=` in the runtime specs).
+  15 new assertions covering the happy path, fence-stripping, `{{ var }}`
+  substitution, schema exhaustion, missing key, non-claude model, and
+  `retry_on_incomplete: false`.
+
+- **`wait` step type — synchronous and async pause/resume (U5).**
+  Mirrors `StepExecutors::Wait` (`wait.rb`) exactly. Three dispatch paths based on
+  the step's nested `wait:` block: (a) `wait.seconds` present → synchronous
+  completion immediately with `{waited: true, seconds: <n>}` — no actual sleep
+  (byte-parity with the runtime's MVP stub); (b) `wait.until` present → async
+  pause with `reason: "waiting_for_callback"`, `until` recorded in the audit
+  receipt as advisory metadata, resumed via `opensop submit <run_id> <step-id>
+  --local`; (c) neither present → synchronous completion with `{waited: true}`.
+  The async pause path drops through `local_run`'s `waiting_for_callback` branch
+  (already the `*` fallthrough for unrecognised types) and `local_submit` resumes
+  it correctly at `cursor.next_index`. Empty `expects.outputs/schema` means submit
+  accepts any (or no) output. 16 new assertions covering all three paths including
+  the failure path (second submit on a completed run is rejected).
+
+- **`approval` step type — pause/resume state machine (U4).**
+  An `approval` step pauses the local run: `_local_step_loop` appends a
+  `"waiting"` receipt to `audit.jsonl` (reason: `"waiting_for_approval"`,
+  byte-parity with the runtime's `StepExecutors::Approval`) and returns
+  `"waiting:<index>"`. `local_run` transitions the manifest to
+  `status:"waiting"` and writes the full pause envelope. When the step
+  declares no `inputs[]` or `outputs[]`, `expects.outputs` defaults to
+  `["decision"]` and `expects.schema` to a required enum field
+  `decision: approve|reject`. On submit, the enum constraint is enforced
+  (e.g. `decision=maybe` is rejected). `decided_by` is recorded in the
+  completion receipt. Full round-trip: run → pause at approval →
+  `opensop submit <run_id> <step-id> --local --output decision=approve`
+  → remaining steps run and run completes.
+
+- **`required_if` parity (U4).** The runtime's `validate_outputs!`
+  supports `required_if:` — a field required only when a condition
+  evaluates to true (e.g. `rejection_reason` required only when
+  `decision == 'reject'`). The local validator cannot evaluate arbitrary
+  condition expressions (no `ConditionEvaluator`), so it skips the
+  unconditional required check for any schema field that declares
+  `required_if`. Intentionally permissive — never more restrictive than
+  the server. The gap is documented in a comment in `local_submit`.
+
+### Changed (internal)
+
+- **Extract `_local_step_loop` from `local_run` (U1 — pure refactor, zero behavior change).**
+  The per-step execution kernel is now a standalone function
+  `_local_step_loop <run_dir> <proc_file> <start_index> <ctx_json>`.
+  It iterates steps from `start_index`, dispatches by type, threads context,
+  writes audit receipts, and writes `context.json` after every completed step
+  (live checkpoint). Returns one of `"completed"`, `"failed"`, or
+  `"waiting:<index>"` via stdout. `local_run` sets up the run dir + manifest,
+  delegates to the loop, then finalizes. Prerequisite for U3 (resume at cursor).
+
+- **U3.5 keystone cleanup — cursor semantics, atomic writes, dead-code removal, dynamic type.**
+  `cursor.next_index` now consistently stores the index of the **first step to run
+  on resume** (paused step index + 1) — both in `local_run`'s waiting branch and
+  in `local_submit`'s second-pause path. `local_submit` reads `cursor.next_index`
+  directly without a +1 offset. Context checkpoints in `_local_step_loop` and
+  `local_submit` are now written atomically (temp + mv) to prevent truncation from
+  silently stripping outputs. Removed the duplicated `errors_json` validation block
+  in `local_submit` (the dead first block using a here-string input that was
+  immediately overwritten) and the unused `proc_file2` variable. The resumed-step
+  completion receipt now derives its `type` from the process file
+  (`jq ".steps[$wait_index].type"`) instead of hardcoding `"form"`.
 
 ## [0.6.0] — 2026-06-08
 
@@ -252,6 +412,7 @@ work; v0.6 features only activate inside a cell.
 - `X-SOP-Token` auth header support.
 - `NO_COLOR` support.
 
+[0.7.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Chosen9115/opensop-cli/compare/v0.4.0...v0.4.1

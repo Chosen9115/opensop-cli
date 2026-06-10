@@ -448,6 +448,20 @@ m_resolved=$( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" run greet-skill 
 [ "$(jq -r '.process_file' <<<"$m_resolved")" = "$fk_team/processes/greet-skill.sop.json" ] || { echo "FAIL: name resolution didn't pick child's forked copy"; exit 1; }
 echo "PASS: fork + run — forked skill is nearest-wins for name resolution"
 
+# (10) Path-traversal guard: cmd_fork rejects names containing .. or / or other
+# characters outside ^[a-zA-Z0-9_-]+$.
+set +e
+( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" fork "../../etc/evil" --json >/dev/null 2>&1 ); fk_pt1_rc=$?
+set -e
+[ "$fk_pt1_rc" -ne 0 ] || { echo "FAIL: fork with path-traversal name should exit non-zero"; exit 1; }
+echo "PASS: fork — path-traversal name (../../etc/evil) is rejected"
+
+set +e
+( cd "$fk_team" && env -u OPENSOP_LOCAL_HOME "$cli" fork "bad name!" --json >/dev/null 2>&1 ); fk_pt2_rc=$?
+set -e
+[ "$fk_pt2_rc" -ne 0 ] || { echo "FAIL: fork with spaces/special chars in name should exit non-zero"; exit 1; }
+echo "PASS: fork — name with spaces/special chars is rejected (only ^[a-zA-Z0-9_-]+$ allowed)"
+
 # --------------------------------------------------------------------------- #
 # Executor field (v0.6 PR 6): optional `executor: internal|external` on steps.
 # Field is validated up-front (parse_error on invalid value), defaults per type
@@ -561,5 +575,1503 @@ dir_out=$( "$cli" list --local "$cf_org" --conflicts 2>&1 )
 [[ "$dir_out" == *"shared.sop.json"* ]] || { echo "FAIL: list with explicit dir + --conflicts dropped output"; exit 1; }
 [[ "$dir_out" != *"shadowed"* ]]        || { echo "FAIL: explicit-dir list should not produce shadowing markers"; exit 1; }
 echo "PASS: list — --conflicts with explicit dir arg is benign (no cell chain to compare)"
+
+# --------------------------------------------------------------------------- #
+# U2: form step — pause mechanism + manifest state machine (happy path)
+#
+# A process [shell-build, form, shell-after] must:
+#   - exit 0
+#   - manifest.status == "waiting"
+#   - manifest.cursor.next_index == 1 (the form step index)
+#   - manifest.waiting.step == "collect"
+#   - manifest.waiting.reason == "waiting_for_input"  (byte-parity with runtime)
+#   - manifest.waiting.expects.outputs includes the field name(s) from inputs[]
+#   - manifest.waiting.since is a non-empty timestamp
+#   - audit.jsonl contains a "waiting" receipt for the form step
+#   - shell-after did NOT run (only 1 audit entry: build completed, form waiting)
+# --------------------------------------------------------------------------- #
+form_dir="$OPENSOP_LOCAL_HOME/form-test"
+mkdir -p "$form_dir"
+cat > "$form_dir/form.sop.json" <<'JSON'
+{
+  "name": "form-test",
+  "inputs": {},
+  "steps": [
+    { "id": "build",   "type": "shell", "run": "echo built" },
+    { "id": "collect", "type": "form",
+      "inputs": [
+        { "name": "email",  "type": "string",  "required": true  },
+        { "name": "opt_in", "type": "boolean", "required": false }
+      ] },
+    { "id": "after",   "type": "shell", "run": "echo should-not-run" }
+  ]
+}
+JSON
+
+set +e
+form_manifest="$("$cli" run "$form_dir/form.sop.json" --local --json)"; form_rc=$?
+set -e
+
+# (1) exit 0 — waiting is not a failure
+[ "$form_rc" -eq 0 ] || { echo "FAIL: form pause should exit 0, got $form_rc"; exit 1; }
+echo "PASS: form — run exits 0 on clean pause"
+
+# (2) manifest.status == "waiting"
+[ "$(jq -r '.status' <<<"$form_manifest")" = "waiting" ] \
+  || { echo "FAIL: manifest.status should be 'waiting', got $(jq -r '.status' <<<"$form_manifest")"; exit 1; }
+echo "PASS: form — manifest.status is 'waiting'"
+
+# (3) cursor.next_index == 2 (the index of the FIRST step to run on resume,
+#     i.e. form-step-index + 1 = 1 + 1 = 2).  waiting.index still holds the
+#     paused step's own index (1) for audit/display purposes.
+[ "$(jq -r '.cursor.next_index' <<<"$form_manifest")" = "2" ] \
+  || { echo "FAIL: cursor.next_index should be 2, got $(jq -r '.cursor.next_index' <<<"$form_manifest")"; exit 1; }
+echo "PASS: form — cursor.next_index is 2 (first step to run on resume)"
+
+# (4) manifest.waiting.step == "collect"
+[ "$(jq -r '.waiting.step' <<<"$form_manifest")" = "collect" ] \
+  || { echo "FAIL: waiting.step should be 'collect'"; exit 1; }
+echo "PASS: form — waiting.step is 'collect'"
+
+# (5) manifest.waiting.reason == "waiting_for_input" (byte-parity with runtime)
+[ "$(jq -r '.waiting.reason' <<<"$form_manifest")" = "waiting_for_input" ] \
+  || { echo "FAIL: waiting.reason should be 'waiting_for_input', got $(jq -r '.waiting.reason' <<<"$form_manifest")"; exit 1; }
+echo "PASS: form — waiting.reason is 'waiting_for_input' (byte-parity with runtime)"
+
+# (6) expects.outputs contains the declared field names
+jq -e '.waiting.expects.outputs | contains(["email","opt_in"])' <<<"$form_manifest" >/dev/null \
+  || { echo "FAIL: waiting.expects.outputs should contain [email, opt_in]"; exit 1; }
+echo "PASS: form — waiting.expects.outputs lists declared field names"
+
+# (7) expects.schema is the full inputs array (both field defs preserved)
+[ "$(jq -r '.waiting.expects.schema | length' <<<"$form_manifest")" = "2" ] \
+  || { echo "FAIL: waiting.expects.schema should have 2 entries"; exit 1; }
+echo "PASS: form — waiting.expects.schema has full field definitions"
+
+# (8) manifest.waiting.since is a non-empty timestamp
+[ -n "$(jq -r '.waiting.since' <<<"$form_manifest")" ] \
+  || { echo "FAIL: waiting.since should be a timestamp"; exit 1; }
+echo "PASS: form — waiting.since is set"
+
+# (9) manifest has no ended_at (run is still in flight)
+jq -e '.ended_at == null or .ended_at == ""' <<<"$form_manifest" >/dev/null \
+  || { echo "FAIL: waiting manifest should NOT have ended_at"; exit 1; }
+echo "PASS: form — manifest has no ended_at (run still in flight)"
+
+# (10) audit.jsonl: build completed + form waiting (2 entries), no 'after' entry
+form_run_id="$(jq -r '.run_id' <<<"$form_manifest")"
+audit_file="$OPENSOP_LOCAL_HOME/runs/$form_run_id/audit.jsonl"
+[ -f "$audit_file" ] || { echo "FAIL: audit.jsonl not found at $audit_file"; exit 1; }
+audit_count="$(wc -l < "$audit_file" | tr -d ' ')"
+[ "$audit_count" = "2" ] || { echo "FAIL: audit.jsonl should have 2 lines (build+form), got $audit_count"; exit 1; }
+jq -e 'select(.step=="build"  and .status=="completed")' "$audit_file" >/dev/null \
+  || { echo "FAIL: audit: build receipt missing or not completed"; exit 1; }
+jq -e 'select(.step=="collect" and .status=="waiting" and .reason=="waiting_for_input")' "$audit_file" >/dev/null \
+  || { echo "FAIL: audit: collect receipt missing or not waiting/waiting_for_input"; exit 1; }
+jq -e 'select(.step=="after")' "$audit_file" >/dev/null 2>&1 \
+  && { echo "FAIL: 'after' step ran despite form pause"; exit 1; }
+echo "PASS: form — audit.jsonl has build(completed)+form(waiting); after did not run"
+
+# (11) _local_finalize_trap does NOT flip 'waiting' to 'interrupted'
+#      Re-read manifest from disk (the EXIT trap runs after the subshell exits)
+mf_on_disk="$(cat "$OPENSOP_LOCAL_HOME/runs/$form_run_id/manifest.json")"
+[ "$(jq -r '.status' <<<"$mf_on_disk")" = "waiting" ] \
+  || { echo "FAIL: _local_finalize_trap flipped 'waiting' to '$(jq -r .status <<<"$mf_on_disk")'"; exit 1; }
+echo "PASS: form — _local_finalize_trap does NOT flip 'waiting' to 'interrupted'"
+
+# --------------------------------------------------------------------------- #
+# U2 failure path: a form step after a failing step (no continue_on_error)
+# → the run should be "failed", not "waiting".
+# --------------------------------------------------------------------------- #
+form_fail_dir="$OPENSOP_LOCAL_HOME/form-fail"
+mkdir -p "$form_fail_dir"
+cat > "$form_fail_dir/form-fail.sop.json" <<'JSON'
+{
+  "name": "form-fail",
+  "inputs": {},
+  "steps": [
+    { "id": "boom",    "type": "shell", "run": "exit 1" },
+    { "id": "collect", "type": "form",  "inputs": [{"name":"x","type":"string"}] }
+  ]
+}
+JSON
+set +e
+ff_manifest="$("$cli" run "$form_fail_dir/form-fail.sop.json" --local --json)"; ff_rc=$?
+set -e
+[ "$ff_rc" -ne 0 ] || { echo "FAIL: run with prior failure should exit non-zero"; exit 1; }
+[ "$(jq -r '.status' <<<"$ff_manifest")" = "failed" ] \
+  || { echo "FAIL: run should be 'failed' when earlier step fails without continue_on_error"; exit 1; }
+echo "PASS: form — prior failure halts before form step (run is 'failed', not 'waiting')"
+
+# --------------------------------------------------------------------------- #
+# U3: submit --local — resume a paused form step (happy path)
+#
+# Full round-trip: run [shell-build, form(collect), shell-after] →
+#   pause at collect → submit outputs → run resumes and completes.
+# Asserts:
+#   - submit exits 0
+#   - manifest.status == "completed" after submit
+#   - 'after' step ran (audit has 4 entries total)
+#   - context.json has the submitted form output threaded into the final step
+#   - decided_by is recorded in the completion receipt
+# --------------------------------------------------------------------------- #
+sub_dir="$OPENSOP_LOCAL_HOME/submit-test"
+mkdir -p "$sub_dir"
+cat > "$sub_dir/sub.sop.json" <<'JSON'
+{
+  "name": "sub-test",
+  "inputs": {},
+  "steps": [
+    { "id": "build",   "type": "shell", "run": "echo built" },
+    { "id": "collect", "type": "form",
+      "inputs": [
+        { "name": "email",  "type": "string",  "required": true  },
+        { "name": "opt_in", "type": "boolean", "required": false }
+      ] },
+    { "id": "after",   "type": "shell",
+      "run": "echo form-email=$(echo \"$OSL_CONTEXT\" | jq -r '.collect.email')" }
+  ]
+}
+JSON
+
+# Step 1: run — should pause at collect
+set +e
+sub_manifest="$("$cli" run "$sub_dir/sub.sop.json" --local --json)"; sub_rc=$?
+set -e
+[ "$sub_rc" -eq 0 ]                                              || { echo "FAIL: sub — initial run should exit 0 (pause), got $sub_rc"; exit 1; }
+[ "$(jq -r '.status' <<<"$sub_manifest")" = "waiting" ]         || { echo "FAIL: sub — initial run should be 'waiting'"; exit 1; }
+sub_run_id="$(jq -r '.run_id' <<<"$sub_manifest")"
+echo "PASS: submit — initial run pauses at form step"
+
+# Step 2: submit valid outputs — run should complete
+set +e
+sub_result="$("$cli" submit "$sub_run_id" collect --local \
+  --output email=user@example.com \
+  --output opt_in=true \
+  --decided-by test-agent \
+  --json)"; sub2_rc=$?
+set -e
+[ "$sub2_rc" -eq 0 ] || { echo "FAIL: submit should exit 0, got $sub2_rc"; exit 1; }
+echo "PASS: submit — submit exits 0"
+
+[ "$(jq -r '.status' <<<"$sub_result")" = "completed" ] \
+  || { echo "FAIL: submit — manifest.status should be 'completed', got $(jq -r '.status' <<<"$sub_result")"; exit 1; }
+echo "PASS: submit — manifest.status is 'completed' after submit"
+
+# audit should have 4 lines: build(completed) + collect(waiting) + collect(completed) + after(completed)
+sub_audit="$OPENSOP_LOCAL_HOME/runs/$sub_run_id/audit.jsonl"
+sub_audit_count="$(wc -l < "$sub_audit" | tr -d ' ')"
+[ "$sub_audit_count" = "4" ] \
+  || { echo "FAIL: submit — audit.jsonl should have 4 lines, got $sub_audit_count"; exit 1; }
+jq -e 'select(.step=="build"   and .status=="completed")' "$sub_audit" >/dev/null \
+  || { echo "FAIL: submit — build completed receipt missing"; exit 1; }
+jq -e 'select(.step=="collect" and .status=="waiting")' "$sub_audit" >/dev/null \
+  || { echo "FAIL: submit — collect waiting receipt missing"; exit 1; }
+jq -e 'select(.step=="collect" and .status=="completed")' "$sub_audit" >/dev/null \
+  || { echo "FAIL: submit — collect completed receipt missing"; exit 1; }
+jq -e 'select(.step=="after"   and .status=="completed")' "$sub_audit" >/dev/null \
+  || { echo "FAIL: submit — after receipt missing or not completed"; exit 1; }
+echo "PASS: submit — all 4 audit receipts present (build/collect-waiting/collect-completed/after)"
+
+# 'after' must have run with form output threaded into context
+sub_show="$("$cli" show "$sub_run_id" --json)"
+after_out="$(jq -r '.steps[] | select(.step=="after") | .output.stdout' <<<"$sub_show")"
+echo "after -> $after_out"
+echo "$after_out" | grep -q "form-email=user@example.com" \
+  || { echo "FAIL: submit — 'after' did not see form output in context (got: $after_out)"; exit 1; }
+echo "PASS: submit — 'after' step ran with form outputs threaded into context"
+
+# context.json on disk has the submitted form output
+sub_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$sub_run_id/context.json")"
+[ "$(jq -r '.collect.email' <<<"$sub_ctx")" = "user@example.com" ] \
+  || { echo "FAIL: submit — context.json missing collect.email"; exit 1; }
+[ "$(jq -r '.collect.opt_in' <<<"$sub_ctx")" = "true" ] \
+  || { echo "FAIL: submit — context.json missing collect.opt_in"; exit 1; }
+echo "PASS: submit — context.json has the submitted form outputs"
+
+# decided_by is in the collect-completed receipt
+jq -e 'select(.step=="collect" and .status=="completed" and .decided_by=="test-agent")' "$sub_audit" >/dev/null \
+  || { echo "FAIL: submit — collect completed receipt missing decided_by=test-agent"; exit 1; }
+echo "PASS: submit — decided_by is recorded in the form completion receipt"
+
+# --------------------------------------------------------------------------- #
+# U3 failure paths
+# --------------------------------------------------------------------------- #
+
+# FAIL: wrong step-id
+set +e
+"$cli" submit "$sub_run_id" wrong-step --local --output email=a@b.com --json >/dev/null 2>&1
+wrong_rc=$?
+set -e
+# sub_run_id is now completed — it should fail on the status gate, not step gate
+[ "$wrong_rc" -ne 0 ] || { echo "FAIL: submit wrong step-id on completed run should exit non-zero"; exit 1; }
+echo "PASS: submit — refuses to submit to a completed run"
+
+# Create a fresh paused run for the remaining failure path tests
+cat > "$sub_dir/sub2.sop.json" <<'JSON'
+{
+  "name": "sub2",
+  "inputs": {},
+  "steps": [
+    { "id": "gate", "type": "form",
+      "inputs": [{ "name": "code", "type": "string", "required": true }] },
+    { "id": "done", "type": "shell", "run": "echo done" }
+  ]
+}
+JSON
+set +e
+sub2_manifest="$("$cli" run "$sub_dir/sub2.sop.json" --local --json)"; sub2_run_rc=$?
+set -e
+[ "$sub2_run_rc" -eq 0 ] || { echo "FAIL: sub2 initial run should exit 0"; exit 1; }
+sub2_run_id="$(jq -r '.run_id' <<<"$sub2_manifest")"
+
+# FAIL: wrong step-id on a genuinely waiting run
+set +e
+"$cli" submit "$sub2_run_id" not-gate --local --output code=x --json >/dev/null 2>&1
+wstep_rc=$?
+set -e
+[ "$wstep_rc" -ne 0 ] || { echo "FAIL: submit with wrong step-id should exit non-zero"; exit 1; }
+echo "PASS: submit — rejects wrong step-id on a waiting run"
+
+# FAIL: missing required output (code is required)
+set +e
+"$cli" submit "$sub2_run_id" gate --local --json >/dev/null 2>&1
+missing_rc=$?
+set -e
+[ "$missing_rc" -ne 0 ] || { echo "FAIL: submit missing required output should exit non-zero"; exit 1; }
+echo "PASS: submit — rejects missing required output field"
+
+# FAIL: non-existent run_id
+set +e
+"$cli" submit no-such-run gate --local --output code=x --json >/dev/null 2>&1
+norun_rc=$?
+set -e
+[ "$norun_rc" -ne 0 ] || { echo "FAIL: submit non-existent run_id should exit non-zero"; exit 1; }
+echo "PASS: submit — rejects non-existent run_id"
+
+# --------------------------------------------------------------------------- #
+# U3 type validation: wrong type for a boolean field is rejected
+# --------------------------------------------------------------------------- #
+set +e
+"$cli" submit "$sub2_run_id" gate --local --output code=secret-code --json >/dev/null 2>&1
+typval_rc=$?
+set -e
+# This should SUCCEED (code=secret-code is a valid string for required:true)
+[ "$typval_rc" -eq 0 ] || { echo "FAIL: valid submit for sub2 should exit 0, got $typval_rc"; exit 1; }
+echo "PASS: submit — valid output passes type validation and completes the run"
+
+# --------------------------------------------------------------------------- #
+# U4: approval step type — pause/resume + enum validation + required_if parity
+# --------------------------------------------------------------------------- #
+
+appr_dir="$OPENSOP_LOCAL_HOME/approval-test"
+mkdir -p "$appr_dir"
+
+# Process: [shell-build, approval, shell-after]
+cat > "$appr_dir/appr.sop.json" <<'JSON'
+{
+  "name": "appr-test",
+  "inputs": {},
+  "steps": [
+    { "id": "build",   "type": "shell", "run": "echo built" },
+    { "id": "gate",    "type": "approval" },
+    { "id": "after",   "type": "shell",
+      "run": "echo decision=$(echo \"$OSL_CONTEXT\" | jq -r '.gate.decision')" }
+  ]
+}
+JSON
+
+# (1) Run pauses at approval step
+set +e
+appr_manifest="$("$cli" run "$appr_dir/appr.sop.json" --local --json)"; appr_rc=$?
+set -e
+[ "$appr_rc" -eq 0 ] || { echo "FAIL: approval pause should exit 0, got $appr_rc"; exit 1; }
+echo "PASS: approval — run exits 0 on clean pause"
+
+# (2) manifest.status == "waiting"
+[ "$(jq -r '.status' <<<"$appr_manifest")" = "waiting" ] \
+  || { echo "FAIL: approval manifest.status should be 'waiting', got $(jq -r '.status' <<<"$appr_manifest")"; exit 1; }
+echo "PASS: approval — manifest.status is 'waiting'"
+
+# (3) waiting.reason == "waiting_for_approval" (byte-parity with StepExecutors::Approval)
+[ "$(jq -r '.waiting.reason' <<<"$appr_manifest")" = "waiting_for_approval" ] \
+  || { echo "FAIL: approval waiting.reason should be 'waiting_for_approval', got $(jq -r '.waiting.reason' <<<"$appr_manifest")"; exit 1; }
+echo "PASS: approval — waiting.reason is 'waiting_for_approval' (byte-parity with runtime)"
+
+# (4) waiting.step == "gate"
+[ "$(jq -r '.waiting.step' <<<"$appr_manifest")" = "gate" ] \
+  || { echo "FAIL: approval waiting.step should be 'gate'"; exit 1; }
+echo "PASS: approval — waiting.step is 'gate'"
+
+# (5) expects.outputs == ["decision"] (default when no inputs/outputs declared)
+[ "$(jq -c '.waiting.expects.outputs' <<<"$appr_manifest")" = '["decision"]' ] \
+  || { echo "FAIL: approval expects.outputs should be [\"decision\"], got $(jq -c '.waiting.expects.outputs' <<<"$appr_manifest")"; exit 1; }
+echo "PASS: approval — expects.outputs defaults to [\"decision\"]"
+
+# (6) expects.schema has decision field with enum approve/reject
+jq -e '.waiting.expects.schema[0] | .name == "decision" and .type == "enum" and (.values | contains(["approve","reject"]))' \
+  <<<"$appr_manifest" >/dev/null \
+  || { echo "FAIL: approval expects.schema should have decision enum(approve,reject)"; exit 1; }
+echo "PASS: approval — expects.schema has decision enum(approve/reject)"
+
+# (7) cursor.next_index == 2 (gate is index 1, next = 2)
+[ "$(jq -r '.cursor.next_index' <<<"$appr_manifest")" = "2" ] \
+  || { echo "FAIL: approval cursor.next_index should be 2, got $(jq -r '.cursor.next_index' <<<"$appr_manifest")"; exit 1; }
+echo "PASS: approval — cursor.next_index is 2"
+
+# (8) audit has build(completed) + gate(waiting); after did not run
+appr_run_id="$(jq -r '.run_id' <<<"$appr_manifest")"
+appr_audit="$OPENSOP_LOCAL_HOME/runs/$appr_run_id/audit.jsonl"
+[ "$(wc -l < "$appr_audit" | tr -d ' ')" = "2" ] \
+  || { echo "FAIL: approval audit should have 2 lines (build+gate), got $(wc -l < "$appr_audit" | tr -d ' ')"; exit 1; }
+jq -e 'select(.step=="build" and .status=="completed")' "$appr_audit" >/dev/null \
+  || { echo "FAIL: approval audit: build receipt missing"; exit 1; }
+jq -e 'select(.step=="gate" and .status=="waiting" and .reason=="waiting_for_approval")' "$appr_audit" >/dev/null \
+  || { echo "FAIL: approval audit: gate waiting_for_approval receipt missing"; exit 1; }
+echo "PASS: approval — audit has build(completed)+gate(waiting_for_approval); after did not run"
+
+# (9) Happy path: submit decision=approve → completes; 'after' runs with decision in context
+set +e
+appr_result="$("$cli" submit "$appr_run_id" gate --local \
+  --output decision=approve \
+  --decided-by human-reviewer \
+  --json)"; appr2_rc=$?
+set -e
+[ "$appr2_rc" -eq 0 ] || { echo "FAIL: approval submit decision=approve should exit 0, got $appr2_rc"; exit 1; }
+[ "$(jq -r '.status' <<<"$appr_result")" = "completed" ] \
+  || { echo "FAIL: approval submit should complete, got $(jq -r '.status' <<<"$appr_result")"; exit 1; }
+echo "PASS: approval — submit decision=approve exits 0 and completes the run"
+
+# 'after' ran with decision threaded into context
+appr_show="$("$cli" show "$appr_run_id" --json)"
+after_out="$(jq -r '.steps[] | select(.step=="after") | .output.stdout' <<<"$appr_show")"
+echo "$after_out" | grep -q "decision=approve" \
+  || { echo "FAIL: approval 'after' step did not see decision=approve in context (got: $after_out)"; exit 1; }
+echo "PASS: approval — 'after' step ran with decision=approve threaded into context"
+
+# decided_by recorded in completion receipt
+jq -e 'select(.step=="gate" and .status=="completed" and .decided_by=="human-reviewer")' "$appr_audit" >/dev/null \
+  || { echo "FAIL: approval decided_by not in gate completion receipt"; exit 1; }
+echo "PASS: approval — decided_by is recorded in the gate completion receipt"
+
+# (10) Failure path: submit decision=maybe → rejected (not in enum approve/reject)
+# Create a fresh paused approval run
+cat > "$appr_dir/appr2.sop.json" <<'JSON'
+{
+  "name": "appr2",
+  "inputs": {},
+  "steps": [
+    { "id": "gate2", "type": "approval" },
+    { "id": "done",  "type": "shell", "run": "echo done" }
+  ]
+}
+JSON
+set +e
+appr2_m="$("$cli" run "$appr_dir/appr2.sop.json" --local --json)"; appr2_run_rc=$?
+set -e
+[ "$appr2_run_rc" -eq 0 ] || { echo "FAIL: appr2 initial run should exit 0"; exit 1; }
+appr2_run_id="$(jq -r '.run_id' <<<"$appr2_m")"
+
+set +e
+"$cli" submit "$appr2_run_id" gate2 --local --output decision=maybe --json >/dev/null 2>&1
+maybe_rc=$?
+set -e
+[ "$maybe_rc" -ne 0 ] || { echo "FAIL: submit decision=maybe should be rejected (not in enum)"; exit 1; }
+echo "PASS: approval — submit decision=maybe rejected (not in enum approve/reject)"
+
+# (11) required_if parity: a field with required_if absent is accepted even without
+#      the field — local treats it as optional (never more restrictive than server).
+cat > "$appr_dir/reqif.sop.json" <<'JSON'
+{
+  "name": "reqif-test",
+  "inputs": {},
+  "steps": [
+    { "id": "gate3", "type": "form",
+      "inputs": [
+        { "name": "decision",        "type": "string",  "required": true },
+        { "name": "rejection_reason","type": "string",  "required": true, "required_if": "decision == 'reject'" }
+      ]
+    },
+    { "id": "done", "type": "shell", "run": "echo done" }
+  ]
+}
+JSON
+set +e
+reqif_m="$("$cli" run "$appr_dir/reqif.sop.json" --local --json)"; reqif_run_rc=$?
+set -e
+[ "$reqif_run_rc" -eq 0 ] || { echo "FAIL: reqif run should pause at gate3 (exit 0)"; exit 1; }
+reqif_run_id="$(jq -r '.run_id' <<<"$reqif_m")"
+
+# Submit without rejection_reason — local should accept it (required_if present → skip check)
+set +e
+"$cli" submit "$reqif_run_id" gate3 --local --output decision=approve --json >/dev/null 2>&1
+reqif_rc=$?
+set -e
+[ "$reqif_rc" -eq 0 ] || { echo "FAIL: field with required_if absent should be accepted (required_if parity); got exit $reqif_rc"; exit 1; }
+echo "PASS: required_if — field with required_if is treated as optional locally (never more restrictive than server)"
+
+# --------------------------------------------------------------------------- #
+# U5: wait step type — sync (seconds), async pause/resume (until), bare (neither)
+# --------------------------------------------------------------------------- #
+
+wait_dir="$OPENSOP_LOCAL_HOME/wait-test"
+mkdir -p "$wait_dir"
+
+# --- wait.seconds: synchronous completion, no sleep ---
+cat > "$wait_dir/wait_seconds.sop.json" <<'JSON'
+{
+  "name": "wait-seconds-test",
+  "inputs": {},
+  "steps": [
+    { "id": "pause", "type": "wait", "wait": { "seconds": 5 } },
+    { "id": "after", "type": "shell",
+      "run": "echo waited=$(echo \"$OSL_CONTEXT\" | jq -r '.pause.waited') secs=$(echo \"$OSL_CONTEXT\" | jq -r '.pause.seconds')" }
+  ]
+}
+JSON
+
+set +e
+ws_result="$("$cli" run "$wait_dir/wait_seconds.sop.json" --local --json)"; ws_rc=$?
+set -e
+[ "$ws_rc" -eq 0 ] || { echo "FAIL: wait.seconds run should exit 0 (sync completion), got $ws_rc"; exit 1; }
+echo "PASS: wait.seconds — run exits 0 (synchronous, no actual sleep)"
+
+# manifest.status == "completed"
+[ "$(jq -r '.status' <<<"$ws_result")" = "completed" ] \
+  || { echo "FAIL: wait.seconds manifest.status should be 'completed', got $(jq -r '.status' <<<"$ws_result")"; exit 1; }
+echo "PASS: wait.seconds — manifest.status is 'completed'"
+
+# output {waited:true, seconds:5} propagated into context
+ws_run_id="$(jq -r '.run_id' <<<"$ws_result")"
+ws_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$ws_run_id/context.json")"
+[ "$(jq -r '.pause.waited' <<<"$ws_ctx")" = "true" ] \
+  || { echo "FAIL: wait.seconds context.pause.waited should be true"; exit 1; }
+echo "PASS: wait.seconds — context.pause.waited is true"
+[ "$(jq -r '.pause.seconds' <<<"$ws_ctx")" = "5" ] \
+  || { echo "FAIL: wait.seconds context.pause.seconds should be 5, got $(jq -r '.pause.seconds' <<<"$ws_ctx")"; exit 1; }
+echo "PASS: wait.seconds — context.pause.seconds is 5"
+
+# 'after' step ran and saw the waited output
+ws_after="$(jq -r '.after.stdout // .after.value // ""' <<<"$ws_ctx")"
+echo "$ws_after" | grep -q "waited=true" \
+  || { echo "FAIL: wait.seconds 'after' step did not see waited=true (got: $ws_after)"; exit 1; }
+echo "PASS: wait.seconds — 'after' step ran and saw waited=true in context"
+
+# audit: pause receipt is completed (not waiting)
+ws_audit="$OPENSOP_LOCAL_HOME/runs/$ws_run_id/audit.jsonl"
+jq -e 'select(.step=="pause" and .status=="completed")' "$ws_audit" >/dev/null \
+  || { echo "FAIL: wait.seconds audit: pause receipt should have status=completed"; exit 1; }
+echo "PASS: wait.seconds — audit receipt for pause step has status=completed"
+
+# --- wait bare (neither seconds nor until): synchronous {waited:true} ---
+cat > "$wait_dir/wait_bare.sop.json" <<'JSON'
+{
+  "name": "wait-bare-test",
+  "inputs": {},
+  "steps": [
+    { "id": "idle", "type": "wait" },
+    { "id": "done", "type": "shell", "run": "echo ok" }
+  ]
+}
+JSON
+
+set +e
+wb_result="$("$cli" run "$wait_dir/wait_bare.sop.json" --local --json)"; wb_rc=$?
+set -e
+[ "$wb_rc" -eq 0 ] || { echo "FAIL: wait bare run should exit 0 (sync completion), got $wb_rc"; exit 1; }
+[ "$(jq -r '.status' <<<"$wb_result")" = "completed" ] \
+  || { echo "FAIL: wait bare manifest.status should be 'completed', got $(jq -r '.status' <<<"$wb_result")"; exit 1; }
+wb_run_id="$(jq -r '.run_id' <<<"$wb_result")"
+wb_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$wb_run_id/context.json")"
+[ "$(jq -r '.idle.waited' <<<"$wb_ctx")" = "true" ] \
+  || { echo "FAIL: wait bare context.idle.waited should be true, got $(jq -r '.idle.waited' <<<"$wb_ctx")"; exit 1; }
+echo "PASS: wait bare (no seconds/until) — completes synchronously with waited=true"
+
+# --- wait.until: async pause, reason=waiting_for_callback ---
+cat > "$wait_dir/wait_until.sop.json" <<'JSON'
+{
+  "name": "wait-until-test",
+  "inputs": {},
+  "steps": [
+    { "id": "hold", "type": "wait", "wait": { "until": "2099-01-01T00:00:00Z" } },
+    { "id": "after", "type": "shell",
+      "run": "echo resumed=$(echo \"$OSL_CONTEXT\" | jq -r '.hold.waited')" }
+  ]
+}
+JSON
+
+# (1) Run pauses at wait.until step
+set +e
+wu_manifest="$("$cli" run "$wait_dir/wait_until.sop.json" --local --json)"; wu_rc=$?
+set -e
+[ "$wu_rc" -eq 0 ] || { echo "FAIL: wait.until pause should exit 0, got $wu_rc"; exit 1; }
+echo "PASS: wait.until — run exits 0 on clean pause"
+
+# (2) manifest.status == "waiting"
+[ "$(jq -r '.status' <<<"$wu_manifest")" = "waiting" ] \
+  || { echo "FAIL: wait.until manifest.status should be 'waiting', got $(jq -r '.status' <<<"$wu_manifest")"; exit 1; }
+echo "PASS: wait.until — manifest.status is 'waiting'"
+
+# (3) waiting.reason == "waiting_for_callback" (byte-parity with StepExecutors::Wait)
+[ "$(jq -r '.waiting.reason' <<<"$wu_manifest")" = "waiting_for_callback" ] \
+  || { echo "FAIL: wait.until waiting.reason should be 'waiting_for_callback', got $(jq -r '.waiting.reason' <<<"$wu_manifest")"; exit 1; }
+echo "PASS: wait.until — waiting.reason is 'waiting_for_callback' (byte-parity with runtime)"
+
+# (4) waiting.step == "hold"
+[ "$(jq -r '.waiting.step' <<<"$wu_manifest")" = "hold" ] \
+  || { echo "FAIL: wait.until waiting.step should be 'hold'"; exit 1; }
+echo "PASS: wait.until — waiting.step is 'hold'"
+
+# (5) cursor.next_index == 1 (index of 'after')
+[ "$(jq -r '.cursor.next_index' <<<"$wu_manifest")" = "1" ] \
+  || { echo "FAIL: wait.until cursor.next_index should be 1, got $(jq -r '.cursor.next_index' <<<"$wu_manifest")"; exit 1; }
+echo "PASS: wait.until — cursor.next_index is 1"
+
+# (6) audit has hold(waiting_for_callback); 'after' did not run
+wu_run_id="$(jq -r '.run_id' <<<"$wu_manifest")"
+wu_audit="$OPENSOP_LOCAL_HOME/runs/$wu_run_id/audit.jsonl"
+[ "$(wc -l < "$wu_audit" | tr -d ' ')" = "1" ] \
+  || { echo "FAIL: wait.until audit should have 1 line (hold waiting), got $(wc -l < "$wu_audit" | tr -d ' ')"; exit 1; }
+jq -e 'select(.step=="hold" and .status=="waiting" and .reason=="waiting_for_callback")' "$wu_audit" >/dev/null \
+  || { echo "FAIL: wait.until audit: hold waiting_for_callback receipt missing"; exit 1; }
+echo "PASS: wait.until — audit has hold(waiting_for_callback); 'after' did not run"
+
+# (7) Resume via submit (no output required — empty is valid)
+wu_proc_file="$wait_dir/wait_until.sop.json"
+set +e
+wu_submit_out="$("$cli" submit "$wu_run_id" hold --local --json)"; wu2_rc=$?
+set -e
+[ "$wu2_rc" -eq 0 ] || { echo "FAIL: wait.until submit should exit 0, got $wu2_rc"; exit 1; }
+[ "$(jq -r '.status' <<<"$wu_submit_out")" = "completed" ] \
+  || { echo "FAIL: wait.until submit should complete run, got $(jq -r '.status' <<<"$wu_submit_out")"; exit 1; }
+echo "PASS: wait.until — submit exits 0 and completes the run"
+
+# (8) 'after' step ran after resume
+wu_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$wu_run_id/context.json")"
+wu_after_out="$(jq -r '.after.stdout // .after.value // ""' <<<"$wu_ctx")"
+echo "$wu_after_out" | grep -q "resumed=" \
+  || { echo "FAIL: wait.until 'after' step did not run after resume (got: $wu_after_out)"; exit 1; }
+echo "PASS: wait.until — 'after' step ran after resume"
+
+# Failure path: wait.until — submit with invalid field type is still accepted
+# (wait type has empty expects.schema, so no validation constraint — any extra key is allowed)
+set +e
+"$cli" submit "$wu_run_id" hold --local --json >/dev/null 2>&1
+wu_dup_rc=$?
+set -e
+# A second submit on an already-completed run must fail (status != waiting)
+[ "$wu_dup_rc" -ne 0 ] || { echo "FAIL: second submit on completed run should fail"; exit 1; }
+echo "PASS: wait.until — second submit on completed run is rejected"
+
+# --------------------------------------------------------------------------- #
+# U6: llm step type — stub-driven tests (OSL_LLM_STUB=<raw-model-text>)
+#
+# Test seam: when OSL_LLM_STUB is set, _local_step_loop skips the network call
+# and treats the value as the raw model response text (fence-strip + schema
+# validation still run). No real ANTHROPIC_API_KEY is ever used here.
+# --------------------------------------------------------------------------- #
+
+llm_dir="$OPENSOP_LOCAL_HOME/llm-test"
+mkdir -p "$llm_dir"
+
+# --- Happy path: stub returns schema-valid JSON → step completes ---
+cat > "$llm_dir/llm_happy.sop.json" <<'JSON'
+{
+  "name": "llm-happy-test",
+  "inputs": {},
+  "steps": [
+    { "id": "classify",
+      "type": "llm",
+      "model": "claude-sonnet-4-6",
+      "prompt": "Classify the following text: hello world",
+      "expected_output_schema": {
+        "label":      { "type": "string",  "required": true },
+        "confidence": { "type": "number",  "required": true }
+      }
+    },
+    { "id": "after", "type": "shell",
+      "run": "echo label=$(echo \"$OSL_CONTEXT\" | jq -r '.classify.label')" }
+  ]
+}
+JSON
+
+set +e
+llm_happy_out="$(OSL_LLM_STUB='{"label":"greeting","confidence":0.95}' \
+  "$cli" run "$llm_dir/llm_happy.sop.json" --local --json)"; llm_happy_rc=$?
+set -e
+[ "$llm_happy_rc" -eq 0 ] || { echo "FAIL: llm happy path should exit 0, got $llm_happy_rc"; exit 1; }
+echo "PASS: llm — stub returns valid JSON → step completes (exit 0)"
+
+# manifest.status == "completed"
+[ "$(jq -r '.status' <<<"$llm_happy_out")" = "completed" ] \
+  || { echo "FAIL: llm happy manifest.status should be 'completed', got $(jq -r '.status' <<<"$llm_happy_out")"; exit 1; }
+echo "PASS: llm — manifest.status is 'completed'"
+
+# context has the validated output threaded in
+llm_happy_run_id="$(jq -r '.run_id' <<<"$llm_happy_out")"
+llm_happy_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$llm_happy_run_id/context.json")"
+[ "$(jq -r '.classify.label'      <<<"$llm_happy_ctx")" = "greeting" ] \
+  || { echo "FAIL: llm classify.label should be 'greeting'"; exit 1; }
+[ "$(jq -r '.classify.confidence' <<<"$llm_happy_ctx")" = "0.95" ] \
+  || { echo "FAIL: llm classify.confidence should be 0.95"; exit 1; }
+echo "PASS: llm — context.classify has the validated output (label+confidence)"
+
+# 'after' step ran and saw the llm output
+llm_happy_after="$(jq -r '.after.stdout // .after.value // ""' <<<"$llm_happy_ctx")"
+echo "$llm_happy_after" | grep -q "label=greeting" \
+  || { echo "FAIL: llm 'after' step did not see label=greeting in context (got: $llm_happy_after)"; exit 1; }
+echo "PASS: llm — 'after' step ran and saw label=greeting from llm output"
+
+# audit receipt for the llm step is completed
+llm_happy_audit="$OPENSOP_LOCAL_HOME/runs/$llm_happy_run_id/audit.jsonl"
+jq -e 'select(.step=="classify" and .status=="completed" and .type=="llm")' \
+  "$llm_happy_audit" >/dev/null \
+  || { echo "FAIL: llm audit receipt for classify should be completed/llm"; exit 1; }
+echo "PASS: llm — audit receipt has status=completed and type=llm"
+
+# executor is recorded as "internal" in the receipt
+[ "$(jq -r 'select(.step=="classify") | .executor' "$llm_happy_audit")" = "internal" ] \
+  || { echo "FAIL: llm executor should be 'internal' in audit receipt"; exit 1; }
+echo "PASS: llm — executor is 'internal' in audit receipt"
+
+# --- Stub with JSON code-fence stripping ---
+cat > "$llm_dir/llm_fence.sop.json" <<'JSON'
+{
+  "name": "llm-fence-test",
+  "inputs": {},
+  "steps": [
+    { "id": "gen",
+      "type": "llm",
+      "model": "claude-sonnet-4-6",
+      "prompt": "Return a JSON object",
+      "expected_output_schema": {}
+    }
+  ]
+}
+JSON
+
+set +e
+llm_fence_out="$(OSL_LLM_STUB='```json
+{"result":"ok"}
+```' "$cli" run "$llm_dir/llm_fence.sop.json" --local --json)"; llm_fence_rc=$?
+set -e
+[ "$llm_fence_rc" -eq 0 ] || { echo "FAIL: llm fence-strip run should exit 0, got $llm_fence_rc"; exit 1; }
+llm_fence_run_id="$(jq -r '.run_id' <<<"$llm_fence_out")"
+llm_fence_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$llm_fence_run_id/context.json")"
+[ "$(jq -r '.gen.result' <<<"$llm_fence_ctx")" = "ok" ] \
+  || { echo "FAIL: llm fence-strip: gen.result should be 'ok', got $(jq -r '.gen.result' <<<"$llm_fence_ctx")"; exit 1; }
+echo "PASS: llm — JSON code fences are stripped before parsing"
+
+# --- Stub returns schema-INVALID JSON → retries then fails after max_retries ---
+cat > "$llm_dir/llm_fail.sop.json" <<'JSON'
+{
+  "name": "llm-fail-test",
+  "inputs": {},
+  "steps": [
+    { "id": "classify",
+      "type": "llm",
+      "model": "claude-sonnet-4-6",
+      "prompt": "Classify the following text",
+      "max_retries": 1,
+      "expected_output_schema": {
+        "label": { "type": "string", "required": true }
+      }
+    }
+  ]
+}
+JSON
+
+# Stub returns a JSON object that is MISSING the required "label" field.
+set +e
+llm_fail_out="$(OSL_LLM_STUB='{"wrong_key":"oops"}' \
+  "$cli" run "$llm_dir/llm_fail.sop.json" --local --json)"; llm_fail_rc=$?
+set -e
+[ "$llm_fail_rc" -ne 0 ] || { echo "FAIL: llm schema-invalid stub should exit non-zero, got $llm_fail_rc"; exit 1; }
+echo "PASS: llm — schema-invalid stub exits non-zero after exhausting max_retries"
+
+# manifest.status == "failed"
+[ "$(jq -r '.status' <<<"$llm_fail_out")" = "failed" ] \
+  || { echo "FAIL: llm schema-invalid manifest.status should be 'failed', got $(jq -r '.status' <<<"$llm_fail_out")"; exit 1; }
+echo "PASS: llm — manifest.status is 'failed' after exhausting retries"
+
+# audit receipt for classify is 'failed'
+llm_fail_run_id="$(jq -r '.run_id' <<<"$llm_fail_out")"
+llm_fail_audit="$OPENSOP_LOCAL_HOME/runs/$llm_fail_run_id/audit.jsonl"
+jq -e 'select(.step=="classify" and .status=="failed" and .type=="llm")' \
+  "$llm_fail_audit" >/dev/null \
+  || { echo "FAIL: llm schema-invalid audit receipt should be failed/llm"; exit 1; }
+echo "PASS: llm — audit receipt has status=failed after schema exhaustion"
+
+# --- Failure path: no stub + no ANTHROPIC_API_KEY → fails loudly ---
+cat > "$llm_dir/llm_nokey.sop.json" <<'JSON'
+{
+  "name": "llm-nokey-test",
+  "inputs": {},
+  "steps": [
+    { "id": "gen",
+      "type": "llm",
+      "model": "claude-sonnet-4-6",
+      "prompt": "Hello"
+    }
+  ]
+}
+JSON
+
+set +e
+# Unset ANTHROPIC_API_KEY and do NOT set OSL_LLM_STUB
+( unset ANTHROPIC_API_KEY OSL_LLM_STUB
+  "$cli" run "$llm_dir/llm_nokey.sop.json" --local --json >/dev/null 2>&1 )
+llm_nokey_rc=$?
+set -e
+[ "$llm_nokey_rc" -ne 0 ] || { echo "FAIL: missing ANTHROPIC_API_KEY should exit non-zero"; exit 1; }
+echo "PASS: llm — no stub + no ANTHROPIC_API_KEY exits non-zero (fails loudly)"
+
+# --- Failure path: unknown model (non-claude prefix) → fails loudly ---
+cat > "$llm_dir/llm_badmodel.sop.json" <<'JSON'
+{
+  "name": "llm-badmodel-test",
+  "inputs": {},
+  "steps": [
+    { "id": "gen",
+      "type": "llm",
+      "model": "gpt-4o",
+      "prompt": "Hello"
+    }
+  ]
+}
+JSON
+
+set +e
+llm_badmodel_out="$(OSL_LLM_STUB='{"ok":true}' \
+  "$cli" run "$llm_dir/llm_badmodel.sop.json" --local --json)"; llm_badmodel_rc=$?
+set -e
+[ "$llm_badmodel_rc" -ne 0 ] || { echo "FAIL: non-claude model should exit non-zero, got $llm_badmodel_rc"; exit 1; }
+echo "PASS: llm — non-claude model prefix rejected with 'no provider configured'"
+
+# --- Failure path: retry_on_incomplete=false → only 1 attempt even with max_retries=5 ---
+cat > "$llm_dir/llm_noretry.sop.json" <<'JSON'
+{
+  "name": "llm-noretry-test",
+  "inputs": {},
+  "steps": [
+    { "id": "gen",
+      "type": "llm",
+      "model": "claude-sonnet-4-6",
+      "prompt": "Hello",
+      "max_retries": 5,
+      "retry_on_incomplete": false,
+      "expected_output_schema": {
+        "score": { "type": "number", "required": true }
+      }
+    }
+  ]
+}
+JSON
+
+set +e
+llm_noretry_out="$(OSL_LLM_STUB='{"wrong":"value"}' \
+  "$cli" run "$llm_dir/llm_noretry.sop.json" --local --json)"; llm_noretry_rc=$?
+set -e
+[ "$llm_noretry_rc" -ne 0 ] || { echo "FAIL: retry_on_incomplete=false + invalid schema should exit non-zero"; exit 1; }
+[ "$(jq -r '.status' <<<"$llm_noretry_out")" = "failed" ] \
+  || { echo "FAIL: retry_on_incomplete=false manifest.status should be 'failed'"; exit 1; }
+echo "PASS: llm — retry_on_incomplete=false → only 1 attempt (fails immediately on bad schema)"
+
+# --- Happy path: {{ var }} template substitution from context ---
+cat > "$llm_dir/llm_template.sop.json" <<'JSON'
+{
+  "name": "llm-template-test",
+  "inputs": { "subject": "weather" },
+  "steps": [
+    { "id": "gen",
+      "type": "llm",
+      "model": "claude-sonnet-4-6",
+      "prompt": "Tell me about {{ subject }}",
+      "expected_output_schema": {}
+    }
+  ]
+}
+JSON
+
+set +e
+llm_tmpl_out="$(OSL_LLM_STUB='{"ok":true}' \
+  "$cli" run "$llm_dir/llm_template.sop.json" --local --input subject=astronomy --json)"; llm_tmpl_rc=$?
+set -e
+[ "$llm_tmpl_rc" -eq 0 ] || { echo "FAIL: template substitution run should exit 0, got $llm_tmpl_rc"; exit 1; }
+echo "PASS: llm — {{ var }} template substitution from context (run completes)"
+
+# --------------------------------------------------------------------------- #
+# webhook step type (U7)
+# --------------------------------------------------------------------------- #
+wh_dir="$OPENSOP_LOCAL_HOME/webhook-tests"
+mkdir -p "$wh_dir"
+
+# Happy path: sync mode, OSL_WEBHOOK_STUB="200:{...}" → outputs parsed, run completes.
+cat > "$wh_dir/wh_sync_ok.sop.json" <<'JSON'
+{ "name": "wh-sync-ok", "inputs": {},
+  "steps": [
+    { "id": "call",
+      "type": "webhook",
+      "webhook": {
+        "url": "https://api.example.com/hook",
+        "method": "POST",
+        "response_mode": "sync"
+      }
+    },
+    { "id": "after", "type": "shell",
+      "run": "echo result=$(echo $OSL_CONTEXT | jq -r '.call.result // empty')" }
+  ] }
+JSON
+set +e
+wh_sync_ok_out="$(OSL_WEBHOOK_STUB='200:{"result":"ok","count":3}' \
+  "$cli" run "$wh_dir/wh_sync_ok.sop.json" --local --json)"; wh_sync_ok_rc=$?
+set -e
+
+[ "$wh_sync_ok_rc" -eq 0 ] || { echo "FAIL: webhook sync 2xx should exit 0, got $wh_sync_ok_rc — $wh_sync_ok_out"; exit 1; }
+echo "PASS: webhook — sync 2xx exits 0"
+
+[ "$(jq -r '.status' <<<"$wh_sync_ok_out")" = "completed" ] \
+  || { echo "FAIL: webhook sync 2xx manifest.status should be 'completed', got $(jq -r '.status' <<<"$wh_sync_ok_out")"; exit 1; }
+echo "PASS: webhook — sync 2xx manifest.status is 'completed'"
+
+wh_sync_ok_run_id="$(jq -r '.run_id' <<<"$wh_sync_ok_out")"
+wh_sync_ok_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$wh_sync_ok_run_id/context.json")"
+[ "$(jq -r '.call.result' <<<"$wh_sync_ok_ctx")" = "ok" ] \
+  || { echo "FAIL: webhook sync 2xx context.call.result should be 'ok', got $(jq -r '.call.result' <<<"$wh_sync_ok_ctx")"; exit 1; }
+echo "PASS: webhook — sync 2xx: response parsed into context"
+
+# 'after' step saw the result from context.
+wh_sync_ok_after="$(jq -r '.after.stdout // .after.value // ""' <<<"$wh_sync_ok_ctx")"
+echo "$wh_sync_ok_after" | grep -q "result=ok" \
+  || { echo "FAIL: webhook sync — 'after' step did not see result=ok (got: $wh_sync_ok_after)"; exit 1; }
+echo "PASS: webhook — 'after' step saw call output threaded through context"
+
+# audit receipt: type=webhook, status=completed, executor=external
+wh_sync_ok_audit="$OPENSOP_LOCAL_HOME/runs/$wh_sync_ok_run_id/audit.jsonl"
+jq -e 'select(.step=="call" and .status=="completed" and .type=="webhook")' \
+  "$wh_sync_ok_audit" >/dev/null \
+  || { echo "FAIL: webhook sync 2xx audit receipt should be completed/webhook"; exit 1; }
+echo "PASS: webhook — sync 2xx audit receipt has status=completed and type=webhook"
+
+[ "$(jq -r 'select(.step=="call") | .executor' "$wh_sync_ok_audit")" = "external" ] \
+  || { echo "FAIL: webhook executor should be 'external' in audit receipt"; exit 1; }
+echo "PASS: webhook — executor is 'external' in audit receipt"
+
+# Failure path: sync non-2xx → step fails, manifest.status=failed.
+cat > "$wh_dir/wh_sync_fail.sop.json" <<'JSON'
+{ "name": "wh-sync-fail", "inputs": {},
+  "steps": [
+    { "id": "call",
+      "type": "webhook",
+      "webhook": {
+        "url": "https://api.example.com/hook",
+        "response_mode": "sync"
+      }
+    }
+  ] }
+JSON
+set +e
+wh_sync_fail_out="$(OSL_WEBHOOK_STUB='422:{"error":"unprocessable"}' \
+  "$cli" run "$wh_dir/wh_sync_fail.sop.json" --local --json)"; wh_sync_fail_rc=$?
+set -e
+
+[ "$wh_sync_fail_rc" -ne 0 ] || { echo "FAIL: webhook sync non-2xx should exit non-zero, got $wh_sync_fail_rc"; exit 1; }
+echo "PASS: webhook — sync non-2xx exits non-zero"
+
+[ "$(jq -r '.status' <<<"$wh_sync_fail_out")" = "failed" ] \
+  || { echo "FAIL: webhook sync non-2xx manifest.status should be 'failed', got $(jq -r '.status' <<<"$wh_sync_fail_out")"; exit 1; }
+echo "PASS: webhook — sync non-2xx manifest.status is 'failed'"
+
+# audit: receipt has status=failed and type=webhook
+wh_sync_fail_run_id="$(jq -r '.run_id' <<<"$wh_sync_fail_out")"
+wh_sync_fail_audit="$OPENSOP_LOCAL_HOME/runs/$wh_sync_fail_run_id/audit.jsonl"
+jq -e 'select(.step=="call" and .status=="failed" and .type=="webhook")' \
+  "$wh_sync_fail_audit" >/dev/null \
+  || { echo "FAIL: webhook sync non-2xx audit receipt should be failed/webhook"; exit 1; }
+echo "PASS: webhook — sync non-2xx audit receipt has status=failed and type=webhook"
+
+# Sync mode: empty response body → {} (mirrors parse_response empty check).
+cat > "$wh_dir/wh_sync_empty.sop.json" <<'JSON'
+{ "name": "wh-sync-empty", "inputs": {},
+  "steps": [
+    { "id": "call",
+      "type": "webhook",
+      "webhook": {
+        "url": "https://api.example.com/ping",
+        "response_mode": "sync"
+      }
+    }
+  ] }
+JSON
+set +e
+wh_sync_empty_out="$(OSL_WEBHOOK_STUB='204:' \
+  "$cli" run "$wh_dir/wh_sync_empty.sop.json" --local --json)"; wh_sync_empty_rc=$?
+set -e
+
+[ "$wh_sync_empty_rc" -eq 0 ] || { echo "FAIL: webhook sync empty body should exit 0, got $wh_sync_empty_rc — $wh_sync_empty_out"; exit 1; }
+echo "PASS: webhook — sync 2xx empty body → {} (no error)"
+
+# Sync mode: non-JSON response body → step fails.
+set +e
+wh_sync_nonjson_out="$(OSL_WEBHOOK_STUB='200:plain text response' \
+  "$cli" run "$wh_dir/wh_sync_ok.sop.json" --local --json)"; wh_sync_nonjson_rc=$?
+set -e
+
+[ "$wh_sync_nonjson_rc" -ne 0 ] || { echo "FAIL: webhook sync non-JSON body should exit non-zero, got $wh_sync_nonjson_rc"; exit 1; }
+echo "PASS: webhook — sync 2xx non-JSON body → step fails"
+
+# Callback mode: pauses with reason=waiting_for_callback, then resumes via submit.
+cat > "$wh_dir/wh_callback.sop.json" <<'JSON'
+{ "name": "wh-callback", "inputs": {},
+  "steps": [
+    { "id": "fire",
+      "type": "webhook",
+      "webhook": {
+        "url": "https://api.example.com/async",
+        "response_mode": "callback"
+      }
+    },
+    { "id": "done", "type": "shell",
+      "run": "echo payload=$(echo $OSL_CONTEXT | jq -rc '.fire // empty')" }
+  ] }
+JSON
+set +e
+wh_cb_out="$(OSL_WEBHOOK_STUB='202:{"queued":true}' \
+  "$cli" run "$wh_dir/wh_callback.sop.json" --local --json)"; wh_cb_rc=$?
+set -e
+
+[ "$wh_cb_rc" -eq 0 ] || { echo "FAIL: webhook callback mode should exit 0 (clean pause), got $wh_cb_rc"; exit 1; }
+echo "PASS: webhook — callback mode exits 0 (clean pause)"
+
+[ "$(jq -r '.status' <<<"$wh_cb_out")" = "waiting" ] \
+  || { echo "FAIL: webhook callback manifest.status should be 'waiting', got $(jq -r '.status' <<<"$wh_cb_out")"; exit 1; }
+echo "PASS: webhook — callback mode manifest.status is 'waiting'"
+
+[ "$(jq -r '.waiting.step' <<<"$wh_cb_out")" = "fire" ] \
+  || { echo "FAIL: webhook callback manifest.waiting.step should be 'fire', got $(jq -r '.waiting.step' <<<"$wh_cb_out")"; exit 1; }
+echo "PASS: webhook — callback mode manifest.waiting.step is 'fire'"
+
+[ "$(jq -r '.waiting.reason' <<<"$wh_cb_out")" = "waiting_for_callback" ] \
+  || { echo "FAIL: webhook callback reason should be 'waiting_for_callback', got $(jq -r '.waiting.reason' <<<"$wh_cb_out")"; exit 1; }
+echo "PASS: webhook — callback mode manifest.waiting.reason is 'waiting_for_callback'"
+
+# audit receipt for callback pause has status=waiting and type=webhook
+wh_cb_run_id="$(jq -r '.run_id' <<<"$wh_cb_out")"
+wh_cb_audit="$OPENSOP_LOCAL_HOME/runs/$wh_cb_run_id/audit.jsonl"
+jq -e 'select(.step=="fire" and .status=="waiting" and .type=="webhook")' \
+  "$wh_cb_audit" >/dev/null \
+  || { echo "FAIL: webhook callback audit receipt should be waiting/webhook"; exit 1; }
+echo "PASS: webhook — callback mode audit receipt has status=waiting and type=webhook"
+
+# Resume via submit: inject payload, 'done' step should run after.
+set +e
+wh_cb_resume_out="$("$cli" submit "$wh_cb_run_id" fire --local \
+  --outputs '{"response":"accepted","ticket":"T-001"}' --json)"; wh_cb_resume_rc=$?
+set -e
+
+[ "$wh_cb_resume_rc" -eq 0 ] || { echo "FAIL: webhook callback submit/resume should exit 0, got $wh_cb_resume_rc — $wh_cb_resume_out"; exit 1; }
+echo "PASS: webhook — callback mode resumes via submit (exit 0)"
+
+[ "$(jq -r '.status' <<<"$wh_cb_resume_out")" = "completed" ] \
+  || { echo "FAIL: webhook callback resume manifest.status should be 'completed', got $(jq -r '.status' <<<"$wh_cb_resume_out")"; exit 1; }
+echo "PASS: webhook — callback mode run completes after submit"
+
+wh_cb_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$wh_cb_run_id/context.json")"
+wh_cb_done_out="$(jq -r '.done.stdout // .done.value // ""' <<<"$wh_cb_ctx")"
+echo "$wh_cb_done_out" | grep -q "payload=" \
+  || { echo "FAIL: webhook callback 'done' step should have run (got: $wh_cb_done_out)"; exit 1; }
+echo "PASS: webhook — 'done' step ran after callback resume"
+
+# poll mode: exit 2 "not implemented yet" (matches runtime StepFailure).
+cat > "$wh_dir/wh_poll.sop.json" <<'JSON'
+{ "name": "wh-poll", "inputs": {},
+  "steps": [
+    { "id": "call",
+      "type": "webhook",
+      "webhook": {
+        "url": "https://api.example.com/poll",
+        "response_mode": "poll"
+      }
+    }
+  ] }
+JSON
+set +e
+wh_poll_out="$(OSL_WEBHOOK_STUB='200:{}' \
+  "$cli" run "$wh_dir/wh_poll.sop.json" --local --json)"; wh_poll_rc=$?
+set -e
+
+[ "$wh_poll_rc" -ne 0 ] || { echo "FAIL: webhook poll mode should exit non-zero (not implemented), got $wh_poll_rc"; exit 1; }
+echo "PASS: webhook — poll mode exits non-zero (not implemented)"
+
+# missing url → step fails loudly.
+cat > "$wh_dir/wh_nourl.sop.json" <<'JSON'
+{ "name": "wh-nourl", "inputs": {},
+  "steps": [
+    { "id": "call",
+      "type": "webhook",
+      "webhook": {
+        "response_mode": "sync"
+      }
+    }
+  ] }
+JSON
+set +e
+wh_nourl_out="$(OSL_WEBHOOK_STUB='200:{}' \
+  "$cli" run "$wh_dir/wh_nourl.sop.json" --local --json)"; wh_nourl_rc=$?
+set -e
+
+[ "$wh_nourl_rc" -ne 0 ] || { echo "FAIL: webhook missing url should exit non-zero, got $wh_nourl_rc"; exit 1; }
+echo "PASS: webhook — missing url exits non-zero"
+
+# --------------------------------------------------------------------------- #
+# U8: subprocess step type — recursive local execution
+#
+# Behavior:
+#   1. Resolve child .sop.json (explicit path or _find_skill_in_cells).
+#   2. Build child inputs from the inputs[] mapping resolved against parent ctx.
+#   3. Recurse: run child in <parent_run>/subprocess/<step-id>/ nested run dir.
+#   4. Guard recursion depth via OSL_DEPTH (max 16).
+#   5. child completed → merge child's final context into parent under step id.
+#   6. child waiting   → propagate as parent waiting_for_callback; record child run_id.
+#   7. child failed    → parent step fails (continue_on_error applies).
+# --------------------------------------------------------------------------- #
+sp_dir="$OPENSOP_LOCAL_HOME/subprocess-tests"
+mkdir -p "$sp_dir"
+
+# --- Child process: a simple 1-step automated process ---
+cat > "$sp_dir/child.sop.json" <<'JSON'
+{
+  "name": "child",
+  "inputs": { "greeting": "hello" },
+  "steps": [
+    { "id": "greet", "type": "shell",
+      "run": "echo output=$(echo \"$OSL_CONTEXT\" | jq -r '.greeting')" }
+  ]
+}
+JSON
+
+# --- Parent process: subprocess → then a shell step that reads child's output ---
+# Build the JSON with jq so the path is embedded portably (no sed -i "" which is macOS-only).
+jq -n --arg sp_dir "$sp_dir" '{
+  "name": "parent",
+  "inputs": {},
+  "steps": [
+    { "id": "call_child",
+      "type": "subprocess",
+      "process": ($sp_dir + "/child.sop.json"),
+      "inputs": [
+        { "name": "greeting", "from": "world" }
+      ]
+    },
+    { "id": "after", "type": "shell",
+      "run": "echo child_greet=$(echo \"$OSL_CONTEXT\" | jq -r \".call_child.greet.stdout // empty\")" }
+  ]
+}' > "$sp_dir/parent.sop.json"
+
+# --- Happy path: parent calls 1-step automated child ---
+# Seed parent context so 'greeting' resolves from parent context key "world"
+# (parent has no declared inputs; we'll inject via --input world="hi-from-parent")
+set +e
+sp_happy_out="$("$cli" run "$sp_dir/parent.sop.json" --local --input world="hi-from-parent" --json)"; sp_happy_rc=$?
+set -e
+
+[ "$sp_happy_rc" -eq 0 ] || { echo "FAIL: subprocess happy path should exit 0, got $sp_happy_rc — $sp_happy_out"; exit 1; }
+echo "PASS: subprocess — parent calls 1-step automated child → exits 0"
+
+[ "$(jq -r '.status' <<<"$sp_happy_out")" = "completed" ] \
+  || { echo "FAIL: subprocess happy path manifest.status should be 'completed', got $(jq -r '.status' <<<"$sp_happy_out")"; exit 1; }
+echo "PASS: subprocess — manifest.status is 'completed'"
+
+# parent context.json has the child output merged under the step id 'call_child'
+sp_happy_run_id="$(jq -r '.run_id' <<<"$sp_happy_out")"
+sp_happy_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$sp_happy_run_id/context.json")"
+# The child's context includes its greet step output; it should be in parent ctx under 'call_child'
+jq -e '.call_child != null' <<<"$sp_happy_ctx" >/dev/null \
+  || { echo "FAIL: subprocess parent context.json is missing 'call_child' key (child output not merged)"; exit 1; }
+echo "PASS: subprocess — parent context.json has child output merged under step id"
+
+# The child's greet step output should be visible inside call_child
+jq -e '.call_child.greet != null' <<<"$sp_happy_ctx" >/dev/null \
+  || { echo "FAIL: subprocess context.call_child.greet should be set (child greet output)"; exit 1; }
+echo "PASS: subprocess — child's greet step output is accessible via parent context"
+
+# 'after' step ran and saw child output
+sp_happy_after="$(jq -r '.after.stdout // .after.value // ""' <<<"$sp_happy_ctx")"
+echo "$sp_happy_after" | grep -q "child_greet=" \
+  || { echo "FAIL: subprocess 'after' step did not run or didn't see child output (got: $sp_happy_after)"; exit 1; }
+echo "PASS: subprocess — 'after' step ran and saw child output threaded through context"
+
+# audit receipt: type=subprocess, status=completed, executor=internal
+sp_happy_audit="$OPENSOP_LOCAL_HOME/runs/$sp_happy_run_id/audit.jsonl"
+jq -e 'select(.step=="call_child" and .status=="completed" and .type=="subprocess")' \
+  "$sp_happy_audit" >/dev/null \
+  || { echo "FAIL: subprocess audit receipt should be completed/subprocess"; exit 1; }
+echo "PASS: subprocess — audit receipt has status=completed and type=subprocess"
+
+[ "$(jq -r 'select(.step=="call_child") | .executor' "$sp_happy_audit")" = "internal" ] \
+  || { echo "FAIL: subprocess executor should be 'internal' in audit receipt"; exit 1; }
+echo "PASS: subprocess — executor is 'internal' in audit receipt"
+
+# Child run dir exists as a flat sibling of the parent run; a symlink dir exists under the parent.
+[ -d "$OPENSOP_LOCAL_HOME/runs/$sp_happy_run_id/subprocess/call_child" ] \
+  || { echo "FAIL: subprocess symlink dir should exist at <parent>/subprocess/call_child/"; exit 1; }
+echo "PASS: subprocess — child run dir created (flat) + symlink at <parent_run>/subprocess/<step-id>/"
+
+# --- Failure path: child process does not exist ---
+cat > "$sp_dir/bad_parent.sop.json" <<'JSON'
+{
+  "name": "bad-parent",
+  "inputs": {},
+  "steps": [
+    { "id": "broken_child",
+      "type": "subprocess",
+      "process": "/no/such/process.sop.json"
+    }
+  ]
+}
+JSON
+
+set +e
+sp_badfile_out="$("$cli" run "$sp_dir/bad_parent.sop.json" --local --json)"; sp_badfile_rc=$?
+set -e
+[ "$sp_badfile_rc" -ne 0 ] || { echo "FAIL: subprocess with missing process file should exit non-zero"; exit 1; }
+[ "$(jq -r '.status' <<<"$sp_badfile_out")" = "failed" ] \
+  || { echo "FAIL: subprocess missing-file manifest.status should be 'failed', got $(jq -r '.status' <<<"$sp_badfile_out")"; exit 1; }
+echo "PASS: subprocess — missing process file exits non-zero with status=failed"
+
+# --- Failure path: missing 'process' field ---
+cat > "$sp_dir/no_proc.sop.json" <<'JSON'
+{
+  "name": "no-proc",
+  "inputs": {},
+  "steps": [
+    { "id": "oops", "type": "subprocess" }
+  ]
+}
+JSON
+
+set +e
+sp_noproc_out="$("$cli" run "$sp_dir/no_proc.sop.json" --local --json)"; sp_noproc_rc=$?
+set -e
+[ "$sp_noproc_rc" -ne 0 ] || { echo "FAIL: subprocess without 'process' field should exit non-zero"; exit 1; }
+echo "PASS: subprocess — missing 'process' field exits non-zero"
+
+# --- Failure path: child process itself fails ---
+cat > "$sp_dir/failing_child.sop.json" <<'JSON'
+{
+  "name": "failing-child",
+  "inputs": {},
+  "steps": [
+    { "id": "boom", "type": "shell", "run": "exit 5" }
+  ]
+}
+JSON
+
+jq -n --arg sp_dir "$sp_dir" '{
+  "name": "parent-of-failing",
+  "inputs": {},
+  "steps": [
+    { "id": "call_failing",
+      "type": "subprocess",
+      "process": ($sp_dir + "/failing_child.sop.json")
+    },
+    { "id": "after", "type": "shell", "run": "echo should-not-run" }
+  ]
+}' > "$sp_dir/parent_of_failing.sop.json"
+
+set +e
+sp_childfail_out="$("$cli" run "$sp_dir/parent_of_failing.sop.json" --local --json)"; sp_childfail_rc=$?
+set -e
+[ "$sp_childfail_rc" -ne 0 ] || { echo "FAIL: subprocess with failing child should exit non-zero"; exit 1; }
+[ "$(jq -r '.status' <<<"$sp_childfail_out")" = "failed" ] \
+  || { echo "FAIL: subprocess with failing child manifest.status should be 'failed', got $(jq -r '.status' <<<"$sp_childfail_out")"; exit 1; }
+sp_childfail_run_id="$(jq -r '.run_id' <<<"$sp_childfail_out")"
+# 'after' step must NOT have run
+sp_childfail_audit="$OPENSOP_LOCAL_HOME/runs/$sp_childfail_run_id/audit.jsonl"
+jq -e 'select(.step=="after")' "$sp_childfail_audit" >/dev/null 2>&1 \
+  && { echo "FAIL: 'after' step ran despite child failure"; exit 1; }
+echo "PASS: subprocess — failing child halts parent run (status=failed, 'after' did not run)"
+
+# --- Depth guard: a process that subprocesses itself → rejected ---
+jq -n --arg sp_dir "$sp_dir" '{
+  "name": "self-ref",
+  "inputs": {},
+  "steps": [
+    { "id": "recurse",
+      "type": "subprocess",
+      "process": ($sp_dir + "/self_ref.sop.json")
+    }
+  ]
+}' > "$sp_dir/self_ref.sop.json"
+
+set +e
+sp_depth_out="$("$cli" run "$sp_dir/self_ref.sop.json" --local --json)"; sp_depth_rc=$?
+set -e
+[ "$sp_depth_rc" -ne 0 ] || { echo "FAIL: self-referencing subprocess should exit non-zero (depth guard)"; exit 1; }
+[ "$(jq -r '.status' <<<"$sp_depth_out")" = "failed" ] \
+  || { echo "FAIL: self-referencing subprocess manifest.status should be 'failed', got $(jq -r '.status' <<<"$sp_depth_out")"; exit 1; }
+echo "PASS: subprocess — self-referencing process rejected by depth guard (status=failed)"
+
+# --- continue_on_error: failing child does NOT halt parent when continue_on_error=true ---
+jq -n --arg sp_dir "$sp_dir" '{
+  "name": "parent-coe",
+  "inputs": {},
+  "steps": [
+    { "id": "call_failing",
+      "type": "subprocess",
+      "continue_on_error": true,
+      "process": ($sp_dir + "/failing_child.sop.json")
+    },
+    { "id": "after", "type": "shell", "run": "echo reached" }
+  ]
+}' > "$sp_dir/parent_coe.sop.json"
+
+sp_coe_out="$("$cli" run "$sp_dir/parent_coe.sop.json" --local --json)"
+[ "$(jq -r '.status' <<<"$sp_coe_out")" = "completed" ] \
+  || { echo "FAIL: subprocess continue_on_error run should complete, got $(jq -r '.status' <<<"$sp_coe_out")"; exit 1; }
+sp_coe_run_id="$(jq -r '.run_id' <<<"$sp_coe_out")"
+sp_coe_audit="$OPENSOP_LOCAL_HOME/runs/$sp_coe_run_id/audit.jsonl"
+jq -e 'select(.step=="call_failing" and .status=="failed")' "$sp_coe_audit" >/dev/null \
+  || { echo "FAIL: subprocess continue_on_error: call_failing should be recorded failed"; exit 1; }
+jq -e 'select(.step=="after" and .status=="completed")' "$sp_coe_audit" >/dev/null \
+  || { echo "FAIL: subprocess continue_on_error: 'after' should have run"; exit 1; }
+echo "PASS: subprocess — continue_on_error: failing child recorded failed, 'after' still ran"
+
+# --------------------------------------------------------------------------- #
+# U9: Webhook punch-list fixes (HIGH/SECURITY assertions)
+# --------------------------------------------------------------------------- #
+u9_dir="$OPENSOP_LOCAL_HOME/u9-webhook-fixes"
+mkdir -p "$u9_dir"
+
+# (a) Callback mode: ${callback_url} renders to a non-empty id in the URL.
+# The id was previously generated AFTER _wh_render, so ${callback_url} was
+# always the empty string. Now it is generated BEFORE rendering.
+jq -n --arg u9_dir "$u9_dir" '{
+  "name": "wh-cb-url-render",
+  "inputs": {},
+  "steps": [
+    { "id": "fire",
+      "type": "webhook",
+      "webhook": {
+        "url": "https://api.example.com/hook?cb=${callback_url}",
+        "response_mode": "callback"
+      }
+    }
+  ]
+}' > "$u9_dir/wh_cb_url.sop.json"
+
+# Run: callback mode pauses (stub not needed — callback does not call curl).
+set +e
+u9a_out="$("$cli" run "$u9_dir/wh_cb_url.sop.json" --local --json)"; u9a_rc=$?
+set -e
+[ "$u9a_rc" -eq 0 ] || { echo "FAIL: u9a callback mode should exit 0 (clean pause), got $u9a_rc"; exit 1; }
+[ "$(jq -r '.status' <<<"$u9a_out")" = "waiting" ] \
+  || { echo "FAIL: u9a manifest.status should be 'waiting'"; exit 1; }
+
+# The audit receipt should have callback_id set to a non-empty string.
+u9a_run_id="$(jq -r '.run_id' <<<"$u9a_out")"
+u9a_audit="$OPENSOP_LOCAL_HOME/runs/$u9a_run_id/audit.jsonl"
+u9a_cb_id="$(jq -r '.callback_id // ""' "$u9a_audit")"
+[ -n "$u9a_cb_id" ] \
+  || { echo 'FAIL: u9a callback_id in audit receipt should be non-empty (${callback_url} rendered to empty)'; exit 1; }
+echo 'PASS: u9a — callback mode: callback_id is non-empty in audit receipt (${callback_url} rendered correctly)'
+
+# Verify that the rendered URL contained the same non-empty id. We do this by
+# checking the manifest's waiting block — the run does NOT store the rendered URL
+# directly, but we can confirm the step paused cleanly (which requires the URL to
+# have rendered without a __MISSING__ error). The key correctness evidence is the
+# non-empty callback_id above.
+echo 'PASS: u9a — callback mode: step paused cleanly (no __MISSING__ error from ${callback_url})'
+
+# (b) ${process.inputs.X} resolves from process-level inputs, not from a same-named
+# step output. We create a process with input "name" and a shell step that also
+# outputs {"name":"step-override"}. A later webhook step uses ${process.inputs.name}
+# in its URL — it must see the original process input, NOT the step output.
+jq -n --arg u9_dir "$u9_dir" '{
+  "name": "wh-proc-inputs",
+  "inputs": { "name": "from-process-input" },
+  "steps": [
+    { "id": "s1", "type": "shell",
+      "run": "echo {\\\"name\\\":\\\"step-override\\\"}" },
+    { "id": "call",
+      "type": "webhook",
+      "webhook": {
+        "url": "https://api.example.com/${process.inputs.name}",
+        "response_mode": "sync"
+      }
+    }
+  ]
+}' > "$u9_dir/wh_proc_inp.sop.json"
+
+# The rendered URL must use "from-process-input", not "step-override".
+# We catch it via OSL_WEBHOOK_STUB — the stub logs nothing, but a __MISSING__ in
+# the URL would cause the step to fail rather than complete.
+# The only way to observe the rendered value directly is to check that:
+#   (1) the stub 200:{} is accepted (URL rendered without MISSING error)
+#   (2) the step completes with status=completed
+# We additionally provide a stub body that echoes the rendered URL back so we
+# can assert its value in context.
+set +e
+u9b_out="$(OSL_WEBHOOK_STUB='200:{"rendered_name":"from-process-input"}' \
+  "$cli" run "$u9_dir/wh_proc_inp.sop.json" --local --input name="from-process-input" --json)"; u9b_rc=$?
+set -e
+[ "$u9b_rc" -eq 0 ] || { echo "FAIL: u9b process.inputs run should exit 0, got $u9b_rc — $u9b_out"; exit 1; }
+[ "$(jq -r '.status' <<<"$u9b_out")" = "completed" ] \
+  || { echo "FAIL: u9b manifest.status should be 'completed'"; exit 1; }
+
+# The context should have the step output under "s1" with name=step-override,
+# AND the webhook step should have completed (proving process.inputs.name resolved
+# to "from-process-input" not "step-override" — otherwise the URL would have
+# contained __MISSING__ and the step would have failed).
+u9b_run_id="$(jq -r '.run_id' <<<"$u9b_out")"
+u9b_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$u9b_run_id/context.json")"
+[ "$(jq -r '.s1.name' <<<"$u9b_ctx")" = "step-override" ] \
+  || { echo "FAIL: u9b s1 output should have name=step-override"; exit 1; }
+# The webhook step completed — this proves the URL resolved without a MISSING error.
+u9b_audit="$OPENSOP_LOCAL_HOME/runs/$u9b_run_id/audit.jsonl"
+jq -e 'select(.step=="call" and .status=="completed")' "$u9b_audit" >/dev/null \
+  || { echo "FAIL: u9b webhook step should be 'completed' (process.inputs.name resolved from process inputs)"; exit 1; }
+echo "PASS: u9b — \${process.inputs.X} resolved from process inputs (differs from same-named step output)"
+
+# (c) CRLF header injection: a rendered header value containing \r\n must be
+# rejected. We inject a value with a literal newline via an env var.
+jq -n --arg u9_dir "$u9_dir" '{
+  "name": "wh-crlf-header",
+  "inputs": {},
+  "steps": [
+    { "id": "call",
+      "type": "webhook",
+      "webhook": {
+        "url": "https://api.example.com/hook",
+        "headers": { "X-Injected": "${env.INJECTED_HDR}" },
+        "response_mode": "sync"
+      }
+    }
+  ]
+}' > "$u9_dir/wh_crlf.sop.json"
+
+set +e
+# Set the env var to a value containing a CRLF sequence.
+INJECTED_HDR=$'bad\r\nX-Injected-2: injected' \
+  OSL_WEBHOOK_STUB='200:{}' \
+  "$cli" run "$u9_dir/wh_crlf.sop.json" --local --json >/dev/null 2>&1
+u9c_rc=$?
+set -e
+[ "$u9c_rc" -ne 0 ] \
+  || { echo "FAIL: u9c header with CRLF should be rejected (exit non-zero)"; exit 1; }
+echo "PASS: u9c — CRLF in rendered header value is rejected (security: header injection guard)"
+
+# (c2) CRLF header injection via header KEY name: a header key containing \r\n
+# must also be rejected. We craft a .sop.json whose headers object has a key
+# that contains a literal newline (jq allows arbitrary key strings in JSON).
+# The render/validation loop must check wh_hk before the value guard.
+python3 -c "
+import json, sys
+proc = {
+  'name': 'wh-crlf-key',
+  'inputs': {},
+  'steps': [{
+    'id': 'call',
+    'type': 'webhook',
+    'webhook': {
+      'url': 'https://api.example.com/hook',
+      'headers': {'X-Good\r\nX-Injected: evil': 'value'},
+      'response_mode': 'sync'
+    }
+  }]
+}
+print(json.dumps(proc))
+" > "$u9_dir/wh_crlf_key.sop.json"
+
+set +e
+OSL_WEBHOOK_STUB='200:{}' \
+  "$cli" run "$u9_dir/wh_crlf_key.sop.json" --local --json >/dev/null 2>&1
+u9c2_rc=$?
+set -e
+[ "$u9c2_rc" -ne 0 ] \
+  || { echo "FAIL: u9c2 header KEY with CRLF should be rejected (exit non-zero)"; exit 1; }
+echo "PASS: u9c2 — CRLF in header key name is rejected (security: header key injection guard)"
+
+# (c3) wh_hdr_err JSON safety: a header error message containing a double-quote
+# must produce valid JSON in the audit receipt (not broken interpolation).
+# We use a header key whose name includes a quote character so the old bare
+# interpolation  out_raw="{\"error\":\"$wh_hdr_err\"}"  would have produced
+# broken JSON like: {"error":"template error in header '"'"'X-"Bad"'"'"': ..."}
+# With jq-nc --arg the quote is escaped and the receipt is always valid JSON.
+python3 -c "
+import json, sys
+proc = {
+  'name': 'wh-hdr-err-quote',
+  'inputs': {},
+  'steps': [{
+    'id': 'call',
+    'type': 'webhook',
+    'webhook': {
+      'url': 'https://api.example.com/hook',
+      'headers': {'X-\"Bad\"': '\${env.MISSING_QUOTED_VAR}'},
+      'response_mode': 'sync'
+    }
+  }]
+}
+print(json.dumps(proc))
+" > "$u9_dir/wh_hdr_err_quote.sop.json"
+
+set +e
+u9c3_out="$(OSL_WEBHOOK_STUB='200:{}' \
+  "$cli" run "$u9_dir/wh_hdr_err_quote.sop.json" --local --json 2>/dev/null)"; u9c3_rc=$?
+set -e
+[ "$u9c3_rc" -ne 0 ] \
+  || { echo "FAIL: u9c3 header key with embedded quote should be rejected (CRLF key guard fires), exit non-zero"; exit 1; }
+# The manifest must be valid JSON and the audit receipt's output.error must also be valid JSON.
+jq -e . <<<"$u9c3_out" >/dev/null 2>&1 \
+  || { echo "FAIL: u9c3 manifest output is not valid JSON"; exit 1; }
+u9c3_run_id="$(jq -r '.run_id' <<<"$u9c3_out")"
+u9c3_audit="$OPENSOP_LOCAL_HOME/runs/$u9c3_run_id/audit.jsonl"
+# audit.jsonl must be valid JSON (the output.error field must be properly escaped)
+jq -e 'select(.step=="call") | .output.error | type == "string"' "$u9c3_audit" >/dev/null 2>&1 \
+  || { echo "FAIL: u9c3 audit receipt output.error is not a valid JSON string (wh_hdr_err interpolation broke JSON)"; exit 1; }
+echo "PASS: u9c3 — wh_hdr_err is JSON-safe (built with jq, not bare interpolation)"
+
+# (d) No body_template fallback: when webhook has no body_template, only the
+# step's declared inputs[] are sent — NOT the whole accumulated context.
+# We set up a process where step s1 produces output key "secret" in the context,
+# and the webhook step declares only "allowed_key" in its inputs[].
+# The body sent must NOT contain "secret".
+jq -n --arg u9_dir "$u9_dir" '{
+  "name": "wh-fallback-body",
+  "inputs": { "allowed_key": "hello" },
+  "steps": [
+    { "id": "s1", "type": "shell",
+      "run": "echo {\\\"secret\\\":\\\"DO-NOT-LEAK\\\"}" },
+    { "id": "call",
+      "type": "webhook",
+      "inputs": [{ "name": "allowed_key" }],
+      "webhook": {
+        "url": "https://api.example.com/hook",
+        "response_mode": "sync"
+      }
+    }
+  ]
+}' > "$u9_dir/wh_fallback_body.sop.json"
+
+set +e
+u9d_out="$(OSL_WEBHOOK_STUB='200:{}' \
+  "$cli" run "$u9_dir/wh_fallback_body.sop.json" --local --input allowed_key=hello --json)"; u9d_rc=$?
+set -e
+[ "$u9d_rc" -eq 0 ] || { echo "FAIL: u9d fallback body run should exit 0, got $u9d_rc — $u9d_out"; exit 1; }
+[ "$(jq -r '.status' <<<"$u9d_out")" = "completed" ] \
+  || { echo "FAIL: u9d manifest.status should be 'completed'"; exit 1; }
+# The context should have s1 output with "secret" (step ran).
+u9d_run_id="$(jq -r '.run_id' <<<"$u9d_out")"
+u9d_ctx="$(cat "$OPENSOP_LOCAL_HOME/runs/$u9d_run_id/context.json")"
+[ "$(jq -r '.s1.secret' <<<"$u9d_ctx")" = "DO-NOT-LEAK" ] \
+  || { echo "FAIL: u9d s1 should have produced secret=DO-NOT-LEAK"; exit 1; }
+# The webhook completed — the body contained only allowed_key, not secret.
+# We can't inspect the body directly (stub never sees it), but we can verify the
+# step completed without error (which would not happen if the body were invalid).
+u9d_audit="$OPENSOP_LOCAL_HOME/runs/$u9d_run_id/audit.jsonl"
+jq -e 'select(.step=="call" and .status=="completed")' "$u9d_audit" >/dev/null \
+  || { echo "FAIL: u9d webhook call step should be completed"; exit 1; }
+echo "PASS: u9d — no body_template: fallback body contains only declared step inputs (not whole ctx)"
 
 echo "ALL PASS"

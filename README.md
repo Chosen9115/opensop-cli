@@ -29,7 +29,28 @@ opensop show <run_id>                  # a local run's manifest + per-step recei
 bash test/test.sh                      # golden test
 ```
 
-**Process format:** `.sop.json` (jq-native), mirroring `SPEC.md`. **Step I/O contract:** each step gets the accumulated context (inputs + prior outputs) on stdin and in `$OSL_CONTEXT`; its JSON stdout merges back under the step id. **Step types (local):** `automated`, `shell`, `noop` today; `form`/`approval`/`llm`/`webhook`/`subprocess`/`wait` are the roadmap for full SPEC parity. **Step executor (v0.6):** each step may declare `executor: internal|external`. `external` = work happens in an outside process (script, webhook), OpenSOP orchestrates and receives the receipt; `internal` = the OpenSOP runtime handles the step itself. Optional; defaults apply per step type (`automated`/`shell`/`webhook` → external, `noop`/`form`/`approval`/`notification`/`wait`/`judgment` → internal). Invalid values fail loudly at parse time. The effective executor is recorded in each step's audit receipt. **Receipts:** `$OPENSOP_LOCAL_HOME/runs/<id>/{manifest.json, audit.jsonl, context.json}`. As of v0.6: when cwd is inside an OpenSOP cell, `$OPENSOP_LOCAL_HOME` defaults to the active cell's `.opensop/` (receipts land alongside the processes that produced them); outside any cell it defaults to `~/.opensop-local`. Explicit env override always wins. **Name resolution (v0.6):** inside a cell, `opensop run <name> --local` looks up `processes/<name>.sop.json` in the active cell, then each ancestor cell (nearest wins). Explicit file paths still work as before. The same process file is meant to run on a server runtime *and* locally — portability is the point.
+**Process format:** `.sop.json` (jq-native), mirroring `SPEC.md` v0.6. **Step I/O contract:** each step gets the accumulated context (inputs + prior outputs) on stdin and in `$OSL_CONTEXT`; its JSON stdout merges back under the step id. **Step types (local — v0.7 full SPEC parity):**
+
+| Type | Pause? | Resume trigger | Notes |
+|---|---|---|---|
+| `automated` / `shell` | No | — | Runs a shell script; JSON stdout merged into context |
+| `noop` | No | — | Pass-through; no execution |
+| `form` | Yes — `waiting_for_input` | `submit --output k=v` | Collects structured human/agent input |
+| `approval` | Yes — `waiting_for_approval` | `submit --output decision=approve\|reject` | Defaults to `decision` enum; fully configurable |
+| `wait` | `wait.seconds` → No; `wait.until` → Yes — `waiting_for_callback` | `submit` (no outputs required) | `wait.seconds` completes immediately with `{waited:true}` |
+| `llm` | No | — | Calls Anthropic Claude; requires `ANTHROPIC_API_KEY`; model must start with `claude` |
+| `webhook` | sync → No; callback → Yes — `waiting_for_callback` | `submit --output k=v` | sync asserts 2xx; poll mode not yet implemented |
+| `subprocess` | Propagates child pause | child resume | Recursive local execution; depth-guarded (max 16) |
+
+**Pause/resume lifecycle:** when a step pauses the run, `manifest.status` becomes `waiting` and `manifest.waiting` records the step, reason, and what outputs are expected. Resume with:
+
+```bash
+opensop submit <run_id> <step-id> --local --output key=value
+```
+
+Execution re-enters at `cursor.next_index` — never re-runs completed steps.
+
+**Step executor (v0.6):** each step may declare `executor: internal|external`. `external` = work happens in an outside process (script, webhook), OpenSOP orchestrates and receives the receipt; `internal` = the OpenSOP runtime handles the step itself. Optional; defaults apply per step type (`automated`/`shell`/`webhook` → external, `noop`/`form`/`approval`/`notification`/`wait`/`judgment` → internal). Invalid values fail loudly at parse time. The effective executor is recorded in each step's audit receipt. **Receipts:** `$OPENSOP_LOCAL_HOME/runs/<id>/{manifest.json, audit.jsonl, context.json}`. As of v0.6: when cwd is inside an OpenSOP cell, `$OPENSOP_LOCAL_HOME` defaults to the active cell's `.opensop/` (receipts land alongside the processes that produced them); outside any cell it defaults to `~/.opensop-local`. Explicit env override always wins. **Name resolution (v0.6):** inside a cell, `opensop run <name> --local` looks up `processes/<name>.sop.json` in the active cell, then each ancestor cell (nearest wins). Explicit file paths still work as before. The same process file is meant to run on a server runtime *and* locally — portability is the point.
 
 > **⚠ Trust boundary:** local steps execute as shell **on your machine** — a `.sop.json`'s `shell`/`automated` steps run arbitrary commands. Only run process files you trust (same posture as a `Makefile` or an npm `postinstall`). This matters most for agents: don't `run --local` a process file you just fetched from an untrusted source.
 >
@@ -382,8 +403,10 @@ For discovery, agents should use `opensop search` or `opensop suggest` rather th
 
 - **Bash 4+** assumed. Default macOS bash is 3.2 — install a newer one (`brew install bash`) or run via `/usr/local/bin/bash`.
 - **`register` may be admin-only.** Some OpenSOP deployments restrict `/sop/processes/register` to admin tokens. If you get a 401/403, check your token scope or use the dashboard.
-- **No webhooks.** The CLI doesn't run a server, so it can't receive webhook callbacks. The OpenSOP runtime handles those itself at `/sop/webhooks/<callback_id>`.
-- **Stubbed step types** in OpenSOP v0.2 (`judgment`, `approval`, `subprocess`, `wait`) pause but don't auto-advance — you'll need to `submit` them manually. See the [server's API docs](https://github.com/Chosen9115/opensop/blob/main/docs/API.md#whats-stubbed-v02) for the current state.
+- **No inbound webhook receiver.** The CLI doesn't run a server, so it can't receive webhook callbacks over the network. `webhook` steps in `callback` mode pause the run — resume manually with `opensop submit <run_id> <step-id> --local`. The OpenSOP server runtime handles live inbound callbacks at `/sop/webhooks/<callback_id>`.
+- **`webhook` poll mode** is not yet implemented in the local backend (mirrors the server runtime's current state). The step exits non-zero with a clear message.
+- **`llm` step type** requires `ANTHROPIC_API_KEY` and outbound HTTPS to `api.anthropic.com`. Local runs without network access cannot execute `llm` steps.
+- **`judgment` and `notification` step types** are not yet implemented in the local backend; they will fail the run with a clear error. Use the server runtime for processes that rely on these types.
 
 ## Contributing
 

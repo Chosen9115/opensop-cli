@@ -16,7 +16,7 @@ set -euo pipefail
 # Constants & paths
 # --------------------------------------------------------------------------- #
 
-readonly OPENSOP_CLI_VERSION="0.6.0"
+readonly OPENSOP_CLI_VERSION="0.7.0"
 readonly OPENSOP_HOME="${OPENSOP_HOME:-$HOME/.opensop}"
 readonly CONFIG_FILE="$OPENSOP_HOME/config"
 readonly CACHE_FILE="$OPENSOP_HOME/instances.tsv"
@@ -584,6 +584,12 @@ cmd_fork() {
   done
   [[ -z "$name" ]] && die "usage: opensop fork <name> [--from <cell-path>]" "usage_error" "name the skill to fork"
 
+  # Path-traversal guard: reject names containing anything outside [a-zA-Z0-9_-].
+  # Allows "my-skill", "my_skill", "Skill123"; rejects "../../etc/evil", "../foo".
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] \
+    || die "invalid name '$name' — only letters, digits, hyphens, and underscores allowed" \
+           "usage_error" "use a name matching ^[a-zA-Z0-9_-]+\$"
+
   local active_cell; active_cell="$(_find_scope_root)"
   [[ -z "$active_cell" ]] && die "not inside an OpenSOP cell — run 'opensop init' first" "usage_error" \
                                 "create a cell first, then fork into it"
@@ -689,11 +695,24 @@ ${C_BOLD}EXECUTION${C_RESET}
   cancel <id> [--reason TEXT]   cancel a running instance
 
 ${C_BOLD}LOCAL EXECUTION (--local — internal files, no server)${C_RESET}
-  run <name|file.sop.json> --local  run a process locally; bare name resolves across the cell chain (nearest wins)
-  list --local [dir] [--conflicts]  list local processes; no arg + inside a cell walks the chain; --conflicts marks shadowed entries
-  runs                              list local runs
-  show <run_id>                     show a local run's manifest + per-step receipts
+  run <name|file.sop.json> --local           run a process locally; bare name resolves across the cell chain (nearest wins)
+  submit <run_id> <step-id> --local [opts]   resume a paused (waiting) run — inject outputs and re-enter execution at cursor
+                                             opts: --output k=v (repeatable), --decided-by <actor>, --confidence <float>
+  list --local [dir] [--conflicts]           list local processes; no arg + inside a cell walks the chain; --conflicts marks shadowed entries
+  runs                                       list local runs
+  show <run_id>                              show a local run's manifest + per-step receipts
   ${C_DIM}⚠ local steps run as shell on this machine — only run process files you trust${C_RESET}
+
+${C_BOLD}LOCAL STEP TYPES (v0.7 — full SPEC parity)${C_RESET}
+  automated          run a shell script; JSON stdout merged into context
+  shell              alias for automated
+  noop               no-op placeholder; passes through context unchanged
+  form               pauses run (waiting_for_input); resume via: opensop submit <run_id> <step-id> --local --output k=v
+  approval           pauses run (waiting_for_approval); expects decision=approve|reject (or custom outputs/schema)
+  wait               wait.seconds → completes immediately with {waited:true}; wait.until → pauses (waiting_for_callback)
+  llm                call Anthropic Claude; requires ANTHROPIC_API_KEY; model must start with "claude"
+  webhook            outbound HTTP; sync → completes with response; callback → pauses (waiting_for_callback); poll → unsupported
+  subprocess         run a child process locally; child context merged under step id; depth guard (max 16 levels)
 
 ${C_BOLD}CELLS (v0.6 — fractal addressing)${C_RESET}
   init [--name N] [--parent PATH]   create .opensop/ in cwd; parent auto-detected if cwd is inside an ancestor cell
@@ -745,6 +764,7 @@ ${C_BOLD}EXAMPLES${C_RESET}
   opensop schema validate ./my-process.sop.yaml
   opensop register ./my-process.sop.yaml
   opensop run ./greet.sop.json --local --input name=Ana          # run locally, no server
+  opensop submit <run_id> collect --local --output email=a@b.com # resume a paused form step
   opensop runs                                                   # list local runs
   opensop show <run_id>                                          # local run receipts
 
@@ -1030,6 +1050,8 @@ cmd_cancel() {
 # --------------------------------------------------------------------------- #
 
 cmd_submit() {
+  # --local: resume a paused local run (no server).
+  if [[ "$LOCAL_MODE" == true ]]; then local_submit "$@"; return $?; fi
   [[ $# -lt 2 ]] && die "usage: opensop submit <instance-id> <step-id> [--outputs '<json>' | --output KEY=VALUE ...] [--decided-by WHO] [--confidence N]" "usage_error" "run opensop help"
   local id="$1" step_id="$2"; shift 2
 
@@ -1855,14 +1877,122 @@ local_run() {
     _v_i=$((_v_i+1))
   done
 
-  local run_id run_dir audit started
+  local run_id run_dir started
   run_id="$(_local_run_id)"; run_dir="$OPENSOP_LOCAL_HOME/runs/$run_id"
-  mkdir -p "$run_dir"; audit="$run_dir/audit.jsonl"; started="$(_local_now)"
+  mkdir -p "$run_dir"; started="$(_local_now)"
   trap '_local_finalize_trap "$run_dir"' EXIT    # safety net: never leave a run "running"
   jq -nc --arg n "$name" --arg p "$proc_file" --arg id "$run_id" --arg t "$started" --argjson inp "$ctx" \
     '{run_id:$id, process:$n, process_file:$p, started_at:$t, status:"running", inputs:$inp}' > "$run_dir/manifest.json"
 
-  local i=0 run_status="completed"
+  local loop_status
+  loop_status="$(_local_step_loop "$run_dir" "$proc_file" 0 "$ctx")"
+  local run_status
+  case "$loop_status" in
+    completed)    run_status="completed" ;;
+    failed)       run_status="failed" ;;
+    waiting:*)    run_status="waiting" ;;
+    *)            run_status="failed" ;;
+  esac
+
+  # context.json is written inside _local_step_loop (live checkpoint); just
+  # ensure it exists even on a zero-step edge-case (pre-validated above).
+  [ -f "$run_dir/context.json" ] || echo "$ctx" > "$run_dir/context.json"
+
+  if [ "$run_status" = "waiting" ]; then
+    # Pause path: manifest gets status=waiting + cursor + waiting block.
+    # No ended_at — the run is still in flight, paused at a form/approval/wait step.
+    local wait_index; wait_index="${loop_status#waiting:}"
+    local wait_step wait_since
+    wait_step="$(jq -r ".steps[$wait_index].id // \"step-$wait_index\"" "$proc_file")"
+    wait_since="$(_local_now)"
+    # Build expects: field names + schema from the step's inputs/outputs array.
+    # For approval steps, default to decision:enum(approve,reject) when neither
+    # inputs[] nor outputs[] is declared (matches the runtime's implicit contract).
+    local wait_expects
+    wait_expects="$(jq -c --argjson idx "$wait_index" '
+      .steps[$idx] as $s |
+      ($s.inputs // $s.outputs // null) as $decl |
+      if $decl != null and ($decl | length) > 0 then
+        { outputs: [$decl[].name // empty],
+          schema:  $decl }
+      elif $s.type == "approval" then
+        { outputs: ["decision"],
+          schema:  [{"name":"decision","type":"enum","values":["approve","reject"],"required":true}] }
+      else
+        { outputs: [], schema: [] }
+      end
+    ' "$proc_file")"
+    # Determine reason from step type (byte-parity with runtime sub_state strings).
+    local wait_stype wait_reason
+    wait_stype="$(jq -r ".steps[$wait_index].type // \"automated\"" "$proc_file")"
+    case "$wait_stype" in
+      form)     wait_reason="waiting_for_input" ;;
+      approval) wait_reason="waiting_for_approval" ;;
+      *)        wait_reason="waiting_for_callback" ;;
+    esac
+    jq -c --arg s "waiting" \
+          --argjson idx "$((wait_index + 1))" \
+          --argjson widx "$wait_index" \
+          --arg step "$wait_step" \
+          --arg reason "$wait_reason" \
+          --arg since "$wait_since" \
+          --argjson expects "$wait_expects" \
+       '.status=$s
+        | .cursor={next_index:$idx}
+        | .waiting={step:$step, index:$widx, reason:$reason, expects:$expects, since:$since}' \
+       "$run_dir/manifest.json" > "$run_dir/manifest.json.tmp" \
+    && mv "$run_dir/manifest.json.tmp" "$run_dir/manifest.json"
+    trap - EXIT    # finalized normally; safety net no longer needed
+    if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+      ok "ran $C_BOLD$name$C_RESET locally — waiting at $wait_step"
+      info "  run: $run_id"
+      info "  dir: $run_dir"
+      info "next:  opensop submit $run_id $wait_step --local --output k=v"
+    else
+      jq -c . "$run_dir/manifest.json"
+    fi
+    return 0
+  fi
+
+  local ended; ended="$(_local_now)"
+  jq -c --arg s "$run_status" --arg e "$ended" '.status=$s | .ended_at=$e' \
+     "$run_dir/manifest.json" > "$run_dir/manifest.json.tmp" && mv "$run_dir/manifest.json.tmp" "$run_dir/manifest.json"
+  trap - EXIT    # finalized normally; drop the interrupted-run safety net
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    if [ "$run_status" = completed ]; then ok "ran $C_BOLD$name$C_RESET locally — completed"; else err "ran $name locally — failed"; fi
+    info "  run: $run_id"
+    info "  dir: $run_dir"
+    info "next:  opensop show $run_id"
+  else
+    jq -c . "$run_dir/manifest.json"
+  fi
+  [ "$run_status" = completed ]
+}
+
+# _local_step_loop <run_dir> <proc_file> <start_index> <ctx_json>
+#
+# Shared step-execution kernel. Iterates steps from <start_index>, dispatches
+# by type (automated/shell/noop/form), threads context, writes audit receipts
+# to <run_dir>/audit.jsonl, and writes <run_dir>/context.json after every
+# completed step (live checkpoint — idempotency anchor for future resume).
+#
+# Return contract (stdout, one line):
+#   "completed"       — all steps finished successfully (or continue_on_error)
+#   "failed"          — a step failed and continue_on_error was not set
+#   "waiting:<index>" — step at <index> paused for external input; a "waiting"
+#                       receipt is appended to audit.jsonl before returning
+#
+# The run_id is derived from run_dir's basename so it matches manifest records.
+# proc_dir is derived from proc_file for automated-step script resolution.
+_local_step_loop() {
+  local run_dir="$1" proc_file="$2" start_index="$3" ctx="$4"
+  local run_id; run_id="$(basename "$run_dir")"
+  local proc_dir; proc_dir="$(cd "$(dirname "$proc_file")" && pwd)"
+  local audit="$run_dir/audit.jsonl"
+  local n_steps; n_steps="$(jq '(.steps // []) | length' "$proc_file")"
+
+  local i="$start_index"
   while [ "$i" -lt "$n_steps" ]; do
     local step sid stype srun scont sexec
     step="$(jq -c ".steps[$i]" "$proc_file")"
@@ -1877,7 +2007,7 @@ local_run() {
     if [[ -z "$sexec" ]]; then
       case "$stype" in
         automated|shell|webhook)                          sexec="external" ;;
-        noop|form|approval|notification|wait|judgment)    sexec="internal" ;;
+        noop|form|approval|notification|wait|judgment|llm|subprocess) sexec="internal" ;;
         *)                                                sexec="external" ;;
       esac
     fi
@@ -1901,6 +2031,725 @@ local_run() {
       shell)
         out_raw="$(OSL_CONTEXT="$ctx" OSL_RUN_DIR="$run_dir" OSL_STEP="$sid" bash -c "$srun" <<<"$ctx" 2>>"$run_dir/$sid.stderr.log")" || rc=$? ;;
       noop) out_raw="{}"; rc=0 ;;
+      form)
+        # Pause — append a "waiting" receipt and return the waiting signal.
+        # context.json is already up-to-date (written after last completed step).
+        jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg ex "$sexec" \
+               --arg a "$s_started" \
+          '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:"waiting",
+            reason:"waiting_for_input", started_at:$a}' >> "$audit"
+        echo "waiting:$i"
+        return 0 ;;
+      approval)
+        # Approval pause — byte-parity with StepExecutors::Approval (reason: waiting_for_approval).
+        # context.json is already up-to-date (written after last completed step).
+        jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg ex "$sexec" \
+               --arg a "$s_started" \
+          '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:"waiting",
+            reason:"waiting_for_approval", started_at:$a}' >> "$audit"
+        echo "waiting:$i"
+        return 0 ;;
+      wait)
+        # Wait step — mirrors StepExecutors::Wait exactly (wait.rb).
+        # Three cases based on what's in the step's nested "wait" block:
+        #   wait.seconds present → synchronous: complete immediately with {waited:true, seconds:<n>}.
+        #                          Do NOT actually sleep — MVP synchronous stub (byte-parity with runtime).
+        #   wait.until present   → async pause: reason="waiting_for_callback"; advisory until metadata.
+        #   neither              → synchronous: complete immediately with {waited:true}.
+        local wait_block
+        wait_block="$(jq -c '.wait // {}' <<<"$step")"
+        if jq -e 'has("seconds")' <<<"$wait_block" >/dev/null 2>&1; then
+          # Synchronous — complete immediately, fall through to the audit/context block below.
+          out_raw="$(jq -c '{waited:true, seconds:.seconds}' <<<"$wait_block")"
+          rc=0
+        elif jq -e 'has("until")' <<<"$wait_block" >/dev/null 2>&1; then
+          # Async pause — record an advisory "until" and pause.
+          local wait_until_val
+          wait_until_val="$(jq -r '.until' <<<"$wait_block")"
+          jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg ex "$sexec" \
+                 --arg a "$s_started" --arg u "$wait_until_val" \
+            '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:"waiting",
+              reason:"waiting_for_callback", until:$u, started_at:$a}' >> "$audit"
+          echo "waiting:$i"
+          return 0
+        else
+          # Neither seconds nor until — complete immediately with {waited:true}.
+          out_raw='{"waited":true}'
+          rc=0
+        fi ;;
+      llm)
+        # LLM step — mirrors StepExecutors::Llm + LlmProviders::Anthropic.
+        #
+        # Fields:
+        #   model (required; must start with "claude")
+        #   prompt | prompt_file (resolved relative to proc_dir)
+        #   expected_output_schema (object — optional)
+        #   max_retries (default 2; total attempts = max_retries + 1)
+        #   retry_on_incomplete (default true; false => 1 attempt)
+        #
+        # Test seam: if OSL_LLM_STUB is set, skip the network call entirely and
+        # treat its value as the raw model response text (same fence-strip +
+        # schema validation still runs). Mirrors the runtime's provider_resolver
+        # test seam (TestStub). Never set this in production.
+        #
+        # DESIGN NOTE: all early-exit paths use rc=1 + a sentinel variable llm_ok=false
+        # rather than `break`, because `break` inside `case ... esac` that is itself
+        # inside `while ... done` breaks the outer while loop (not the case block).
+        local llm_ok=true llm_model llm_prompt_file llm_schema_json llm_max_retries llm_retry
+        llm_model="$(jq -r '.model // ""' <<<"$step")"
+        if [[ -z "$llm_model" ]]; then
+          out_raw='{"error":"llm step is missing model"}'; rc=1; llm_ok=false
+        fi
+        if [[ "$llm_ok" == true ]]; then
+          case "$llm_model" in
+            claude*) ;;
+            *) out_raw="{\"error\":\"no provider configured for model '$llm_model'\"}"; rc=1; llm_ok=false ;;
+          esac
+        fi
+
+        # Prompt body: inline prompt or prompt_file (relative to proc_dir).
+        local llm_prompt_body=""
+        if [[ "$llm_ok" == true ]]; then
+          llm_prompt_file="$(jq -r '.prompt_file // ""' <<<"$step")"
+          if [[ -n "$llm_prompt_file" ]]; then
+            local llm_pf_path="$proc_dir/$llm_prompt_file"
+            if [[ ! -f "$llm_pf_path" ]]; then
+              out_raw="{\"error\":\"prompt_file not found: $llm_pf_path\"}"; rc=1; llm_ok=false
+            else
+              llm_prompt_body="$(cat "$llm_pf_path")"
+            fi
+          else
+            llm_prompt_body="$(jq -r '.prompt // ""' <<<"$step")"
+            if [[ -z "$llm_prompt_body" ]]; then
+              out_raw='{"error":"llm step requires prompt or prompt_file"}'; rc=1; llm_ok=false
+            fi
+          fi
+        fi
+
+        # Substitute {{ var }} tokens from the current context (jq).
+        # Each {{var}} is replaced by ctx[var] (stringified) if present; left as-is if not.
+        local llm_rendered_prompt=""
+        if [[ "$llm_ok" == true ]]; then
+          llm_rendered_prompt="$(jq -rn \
+            --arg tmpl "$llm_prompt_body" \
+            --argjson ctx "$ctx" \
+            '$tmpl | gsub("\\{\\{\\s*(?<v>[a-zA-Z_][a-zA-Z0-9_]*)\\s*\\}\\}";
+              if $ctx[.v] != null then ($ctx[.v] | tostring) else "{{" + .v + "}}" end)')"
+        fi
+
+        # Schema (optional).
+        if [[ "$llm_ok" == true ]]; then
+          llm_schema_json="$(jq -c '.expected_output_schema // {}' <<<"$step")"
+        fi
+
+        # Attempt count: max_retries (default 2) + 1, unless retry_on_incomplete=false.
+        local llm_max_attempts=3
+        if [[ "$llm_ok" == true ]]; then
+          llm_retry="$(jq -r '.retry_on_incomplete // true' <<<"$step")"
+          llm_max_retries="$(jq -r '.max_retries // 2' <<<"$step")"
+          if [[ "$llm_retry" == "false" ]]; then
+            llm_max_attempts=1
+          else
+            llm_max_attempts=$(( llm_max_retries + 1 ))
+            [ "$llm_max_attempts" -lt 1 ] && llm_max_attempts=1
+          fi
+        fi
+
+        # Require curl for the real API call (test seam bypasses this).
+        if [[ "$llm_ok" == true && -z "${OSL_LLM_STUB:-}" ]]; then
+          require_curl
+          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+            out_raw='{"error":"ANTHROPIC_API_KEY is not set"}'; rc=1; llm_ok=false
+          fi
+        fi
+
+        # System prompt (asks model for a JSON object matching the schema).
+        # [MEDIUM] Schema is pretty-printed with jq '.' for deterministic, readable
+        # output — previously used a one-line to_entries rendering that was hard to
+        # read and non-deterministic across jq versions.
+        local llm_system_prompt=""
+        if [[ "$llm_ok" == true ]]; then
+          local llm_schema_pretty
+          llm_schema_pretty="$(jq '.' <<<"$llm_schema_json")"
+          llm_system_prompt="You are a precise JSON generator. Respond ONLY with a valid JSON object matching this schema (pretty-printed for readability):
+$llm_schema_pretty
+No prose, no code fences. Output only the JSON object."
+        fi
+
+        # Retry loop — only entered when all pre-checks passed (llm_ok=true).
+        local llm_attempt=1 llm_last_errors="" llm_validated="" llm_failed=false
+        while [[ "$llm_ok" == true && "$llm_attempt" -le "$llm_max_attempts" ]]; do
+          # Prepend corrective preamble on retry.
+          local llm_attempt_prompt
+          if [[ "$llm_attempt" -gt 1 && -n "$llm_last_errors" ]]; then
+            llm_attempt_prompt="Previous attempt failed validation: $llm_last_errors.
+Return JSON only matching the schema.
+
+$llm_rendered_prompt"
+          else
+            llm_attempt_prompt="$llm_rendered_prompt"
+          fi
+
+          # Get the raw text response: stub or real API call.
+          local llm_raw_text=""
+          if [[ -n "${OSL_LLM_STUB:-}" ]]; then
+            llm_raw_text="$OSL_LLM_STUB"
+          else
+            # Build request body.
+            local llm_req_body
+            llm_req_body="$(jq -nc \
+              --arg model "$llm_model" \
+              --arg system "$llm_system_prompt" \
+              --arg user "$llm_attempt_prompt" \
+              '{model:$model, max_tokens:4096, system:$system,
+                messages:[{role:"user", content:$user}]}')"
+
+            # [LOW] curl call uses a bash array so $ANTHROPIC_API_KEY and the
+            # request body are not subject to word-splitting (mirrors wh_curl_args).
+            local llm_resp_tmp; llm_resp_tmp="$(mktemp)"
+            local llm_http_status
+            local llm_curl_args=(-sS -X POST "https://api.anthropic.com/v1/messages"
+              -H "x-api-key: $ANTHROPIC_API_KEY"
+              -H "anthropic-version: 2023-06-01"
+              -H "content-type: application/json"
+              -o "$llm_resp_tmp"
+              -w "%{http_code}"
+              -d "$llm_req_body")
+            if ! llm_http_status="$(curl "${llm_curl_args[@]}" 2>>"$run_dir/$sid.stderr.log")"; then
+              rm -f "$llm_resp_tmp"
+              out_raw='{"error":"curl failed calling Anthropic API"}'; rc=1; llm_failed=true; llm_ok=false; continue
+            fi
+
+            if [[ "$llm_http_status" -ge 400 ]]; then
+              local llm_api_err; llm_api_err="$(cat "$llm_resp_tmp")" ; rm -f "$llm_resp_tmp"
+              out_raw="{\"error\":\"Anthropic API returned HTTP $llm_http_status\",\"detail\":$(jq -c '.' <<<"$llm_api_err" 2>/dev/null || echo "\"$llm_api_err\"")}"; rc=1; llm_failed=true; llm_ok=false; continue
+            fi
+
+            local llm_resp_json; llm_resp_json="$(cat "$llm_resp_tmp")"; rm -f "$llm_resp_tmp"
+
+            # Extract the first text content block.
+            if ! llm_raw_text="$(jq -r '
+              .content | if type != "array" then error("no content array") else . end |
+              (map(select(.type=="text")) | first // first) |
+              if type != "object" then error("no text block") else .text end
+            ' <<<"$llm_resp_json" 2>>"$run_dir/$sid.stderr.log")"; then
+              out_raw='{"error":"Anthropic API response missing text content"}'; rc=1; llm_failed=true; llm_ok=false; continue
+            fi
+          fi
+
+          # Strip ``` fences if present.
+          local llm_cleaned
+          llm_cleaned="$(printf '%s' "$llm_raw_text" \
+            | sed -E 's/^[[:space:]]*```(json)?[[:space:]]*//' \
+            | sed -E 's/[[:space:]]*```[[:space:]]*$//')"
+
+          # Must parse as a valid JSON object.
+          local llm_parsed
+          if ! llm_parsed="$(jq -e 'if type=="object" then . else error("not an object") end' <<<"$llm_cleaned" 2>/dev/null)"; then
+            llm_last_errors="model output is not a valid JSON object"
+            llm_attempt=$(( llm_attempt + 1 ))
+            continue
+          fi
+
+          # Validate against expected_output_schema (required + type + enum checks).
+          # Schema here is an object {field_name: {type, required, ...}} or {} for any.
+          local llm_schema_errors
+          llm_schema_errors="$(jq -rn \
+            --argjson schema "$llm_schema_json" \
+            --argjson parsed "$llm_parsed" \
+            '[ $schema | to_entries[] |
+               . as $e | $e.key as $k | $e.value as $fdef |
+               ($parsed[$k]) as $val |
+               (if ($fdef.required == true) and ($val == null) then
+                  "required field missing: " + $k
+                else null end),
+               (if $val != null then
+                 if   $fdef.type == "number"  and ($val | type) != "number"  then $k + " must be a number"
+                 elif $fdef.type == "boolean" and ($val | type) != "boolean" then $k + " must be a boolean"
+                 elif $fdef.type == "string"  and ($val | type) != "string"  then $k + " must be a string"
+                 elif $fdef.type == "enum" and ($fdef.values != null) and ([$fdef.values[] | . == $val] | any | not) then
+                   $k + " must be one of: " + ($fdef.values | join(", "))
+                 else null end
+               else null end)
+            ] | map(select(. != null)) | join("; ")')"
+
+          if [[ -n "$llm_schema_errors" ]]; then
+            llm_last_errors="$llm_schema_errors"
+            llm_attempt=$(( llm_attempt + 1 ))
+            continue
+          fi
+
+          # Validation passed.
+          llm_validated="$llm_parsed"
+          llm_ok=false  # sentinel to exit the while (validated successfully)
+        done
+
+        if [[ "$llm_failed" == true ]]; then
+          : # out_raw and rc already set inside the loop
+        elif [[ -n "$llm_validated" ]]; then
+          out_raw="$llm_validated"; rc=0
+        elif [[ "$rc" -ne 1 ]]; then
+          # Exhausted attempts without a fatal error — validation always failed.
+          out_raw="{\"error\":\"llm output failed schema validation after $llm_max_attempts attempt(s): $llm_last_errors\"}"; rc=1
+        fi ;;
+      webhook)
+        # Webhook step — mirrors StepExecutors::Webhook (webhook.rb) +
+        # Opensop::Templating (${...} dialect).
+        #
+        # Nested "webhook" block fields:
+        #   url            (required)
+        #   method         (default POST; GET|POST|PUT|PATCH|DELETE)
+        #   headers        (object; values are ${...}-templated)
+        #   body_template  (path relative to proc_dir; else inputs-as-JSON)
+        #   response_mode  (sync|callback|poll; default POST uses sync per SPEC)
+        #   poll_timeout   (ignored in callback mode; documented only)
+        #
+        # Template dialect: ${env.X}, ${process.inputs.Y}, ${callback_url},
+        #   ${X.Y.Z} → bare path into current context (step inputs).
+        #   Applied to url, header values, and body_template content.
+        #
+        # Test seam: OSL_WEBHOOK_STUB="<http_code>:<body>" skips curl entirely.
+        #   Mirrors OSL_LLM_STUB pattern. "200:{}" → 2xx success with {} body.
+        #   Never set in production.
+        #
+        # DESIGN NOTE: same sentinel pattern as llm — wh_ok=false for early exit,
+        # never bare `break` inside case/while.
+        local wh_ok=true wh_block wh_url wh_method wh_mode wh_headers wh_body
+        wh_block="$(jq -c '.webhook // {}' <<<"$step")"
+
+        # Resolve method (default POST) and mode (default sync).
+        wh_method="$(jq -r '.method // "POST"' <<<"$wh_block")"
+        wh_mode="$(jq -r '.response_mode // "sync"' <<<"$wh_block")"
+
+        # Validate mode.
+        case "$wh_mode" in
+          sync|callback|poll) ;;
+          *) out_raw="{\"error\":\"unknown response_mode: $wh_mode (must be sync, callback, or poll)\"}"; rc=1; wh_ok=false ;;
+        esac
+
+        # poll is not implemented (matches runtime's StepFailure).
+        if [[ "$wh_ok" == true && "$wh_mode" == "poll" ]]; then
+          out_raw='{"error":"response_mode: poll is not implemented yet (see SPEC §8 roadmap)"}'; rc=2; wh_ok=false
+        fi
+
+        # Validate method.
+        if [[ "$wh_ok" == true ]]; then
+          case "$wh_method" in
+            GET|POST|PUT|PATCH|DELETE) ;;
+            *) out_raw="{\"error\":\"unsupported HTTP method: $wh_method\"}"; rc=1; wh_ok=false ;;
+          esac
+        fi
+
+        # Capture the process-level initial inputs (stored in manifest.json under
+        # .inputs). This is distinct from the flat accumulated ctx (which includes
+        # later step outputs). ${process.inputs.X} resolves from this snapshot only.
+        local wh_proc_inputs
+        wh_proc_inputs="$(jq -c '.inputs // {}' "$run_dir/manifest.json" 2>/dev/null || echo '{}')"
+
+        # [HIGH] Generate callback id ONCE, BEFORE any rendering, so ${callback_url}
+        # resolves to a real non-empty id in both sync mode (unused but not empty)
+        # and callback mode. Previously the id was generated inside the callback arm,
+        # after _wh_render was already called with "".
+        local wh_cb_id; wh_cb_id="$(date -u +%Y%m%dT%H%M%SZ)-cb-$$-$RANDOM"
+
+        # Template rendering helper (${...} dialect, pure jq).
+        # Resolves: ${env.X}, ${process.inputs.X}, ${callback_url},
+        #           ${payload.X} (→ __MISSING__ in local non-trigger runs),
+        #           ${X.Y.Z} (bare path into flat accumulated context).
+        # ${process.inputs.X} is resolved from wh_proc_inputs (the run's initial
+        # inputs), NOT from the flat ctx — they differ whenever a step output shares
+        # a name with a process input.
+        # Missing variables produce a loud __MISSING__ sentinel; caller checks it.
+        _wh_render() {
+          local tmpl="$1" cb_url="${2:-}"
+          jq -rn \
+            --arg tmpl         "$tmpl" \
+            --argjson ctx      "$ctx" \
+            --argjson proc_inp "$wh_proc_inputs" \
+            --arg cb_url       "$cb_url" \
+            '$tmpl | gsub("\\$\\{(?<expr>[^}]+)\\}";
+              (.expr | ltrimstr(" ") | rtrimstr(" ")) as $e |
+              if   $e == "callback_url"              then $cb_url
+              elif $e | startswith("env.")           then (env[($e | ltrimstr("env."))] // ("__MISSING_ENV__:" + $e))
+              elif $e | startswith("process.inputs.") then
+                   # Resolve from the run initial inputs, not from flat ctx.
+                   (($proc_inp[($e | ltrimstr("process.inputs."))])
+                    | if . == null then ("__MISSING__:" + $e) else tostring end)
+              elif $e | startswith("payload.")       then
+                   # No inbound payload in local non-trigger runs → always missing.
+                   ("__MISSING__:" + $e)
+              else
+                   (reduce ($e | split("."))[] as $k (null;
+                     if . == null then ($ctx[$k] // null) else
+                       if type == "object" then .[$k]
+                       elif type == "array" then .[ ($k | tonumber? // -1) ]
+                       else null end
+                     end) | if . == null then ("__MISSING__:" + $e) else tostring end)
+              end
+            )'
+        }
+
+        # Render URL (required).
+        if [[ "$wh_ok" == true ]]; then
+          local wh_raw_url; wh_raw_url="$(jq -r '.url // ""' <<<"$wh_block")"
+          if [[ -z "$wh_raw_url" ]]; then
+            out_raw='{"error":"webhook.url is required"}'; rc=1; wh_ok=false
+          else
+            # Pass the pre-generated cb_id so ${callback_url} is never empty.
+            wh_url="$(_wh_render "$wh_raw_url" "$wh_cb_id")"
+            if [[ "$wh_url" == *"__MISSING_ENV__:"* || "$wh_url" == *"__MISSING__:"* ]]; then
+              out_raw="{\"error\":\"template error: unresolved variable in webhook.url: $wh_url\"}"; rc=1; wh_ok=false
+            fi
+          fi
+        fi
+
+        # Render headers (object — values are templated strings).
+        local wh_headers_json="{}"
+        if [[ "$wh_ok" == true ]]; then
+          local wh_raw_headers; wh_raw_headers="$(jq -c '.headers // {}' <<<"$wh_block")"
+          local wh_hdr_err=""
+          # Re-render each header value through the same ${} template logic.
+          # We do a key-by-key loop to keep errors recoverable (bash 3.2 safe).
+          # [ITEM 9] The malformed '.[(keys_unsorted | .[$i])]' line below is removed;
+          # only the correct 'keys_unsorted[$i]' idiom remains.
+          local wh_hdr_count wh_hdr_i
+          wh_hdr_count="$(jq 'length' <<<"$wh_raw_headers")"
+          if [[ "$wh_hdr_count" -gt 0 ]]; then
+            local wh_hdr_rendered="{}"
+            wh_hdr_i=0
+            while [[ "$wh_hdr_i" -lt "$wh_hdr_count" ]]; do
+              local wh_hk wh_hv wh_hv_rendered
+              # jq key-by-index idiom (bash 3.2 safe, no mapfile).
+              wh_hk="$(jq -r "keys_unsorted[$wh_hdr_i]" <<<"$wh_raw_headers")"
+              wh_hv="$(jq -r --arg k "$wh_hk" '.[$k]' <<<"$wh_raw_headers")"
+              # [MEDIUM/SECURITY] CRLF header injection guard: reject header KEY names
+              # that contain CR or LF. A key with \r or \n could split HTTP headers and
+              # inject arbitrary headers. Mirrors the value-guard below.
+              if [[ "$wh_hk" == *$'\r'* || "$wh_hk" == *$'\n'* ]]; then
+                wh_hdr_err="security: CRLF characters in header key name — refusing to send"; break
+              fi
+              # Pass the pre-generated cb_id so ${callback_url} resolves correctly.
+              wh_hv_rendered="$(_wh_render "$wh_hv" "$wh_cb_id")"
+              if [[ "$wh_hv_rendered" == *"__MISSING_ENV__:"* || "$wh_hv_rendered" == *"__MISSING__:"* ]]; then
+                wh_hdr_err="template error in header '$wh_hk': $wh_hv_rendered"; break
+              fi
+              # [MEDIUM/SECURITY] CRLF header injection guard: reject rendered header
+              # values that contain CR or LF. A rendered value with \r or \n could split
+              # HTTP headers and inject arbitrary headers or truncate the request.
+              # Choice: fail loudly (rather than strip silently) so the template author
+              # notices the bad value. This mirrors the runtime's HeaderInjection check.
+              if [[ "$wh_hv_rendered" == *$'\r'* || "$wh_hv_rendered" == *$'\n'* ]]; then
+                wh_hdr_err="security: CRLF characters in rendered header value for '$wh_hk' — refusing to send"; break
+              fi
+              wh_hdr_rendered="$(jq -c --arg k "$wh_hk" --arg v "$wh_hv_rendered" '.[$k]=$v' <<<"$wh_hdr_rendered")"
+              wh_hdr_i=$(( wh_hdr_i + 1 ))
+            done
+            if [[ -n "$wh_hdr_err" ]]; then
+              out_raw="$(jq -nc --arg e "$wh_hdr_err" '{error:$e}')"; rc=1; wh_ok=false
+            else
+              wh_headers_json="$wh_hdr_rendered"
+            fi
+          fi
+        fi
+
+        # Build request body.
+        if [[ "$wh_ok" == true ]]; then
+          local wh_body_tmpl_path; wh_body_tmpl_path="$(jq -r '.body_template // ""' <<<"$wh_block")"
+          if [[ -n "$wh_body_tmpl_path" ]]; then
+            # Resolve path relative to proc_dir.
+            local wh_tmpl_abs
+            if [[ "$wh_body_tmpl_path" = /* ]]; then wh_tmpl_abs="$wh_body_tmpl_path"
+            else wh_tmpl_abs="$proc_dir/$wh_body_tmpl_path"; fi
+            if [[ ! -f "$wh_tmpl_abs" ]]; then
+              out_raw="{\"error\":\"body_template not found: $wh_tmpl_abs\"}"; rc=1; wh_ok=false
+            else
+              local wh_tmpl_raw; wh_tmpl_raw="$(cat "$wh_tmpl_abs")"
+              # Pass the pre-generated cb_id so ${callback_url} resolves in the body.
+              wh_body="$(_wh_render "$wh_tmpl_raw" "$wh_cb_id")"
+            fi
+          else
+            # No template: send ONLY the step's declared inputs[] resolved against
+            # the current context, or {} if none declared. Mirrors webhook.rb
+            # build_body which sends step.inputs — not the whole accumulated context.
+            # Sending the whole ctx would leak prior step outputs to external URLs.
+            local wh_step_input_names
+            wh_step_input_names="$(jq -c '[(.inputs // [])[]?.name // empty]' <<<"$step")"
+            wh_body="$(jq -c --argjson ctx "$ctx" --argjson names "$wh_step_input_names" '
+              $names | map(. as $n | {key: $n, value: ($ctx[$n] // null)}) | from_entries
+              | with_entries(select(.value != null))
+            ' <<<"$step")"
+          fi
+        fi
+
+        # Dispatch: sync fires curl now; callback pauses.
+        if [[ "$wh_ok" == true ]]; then
+          case "$wh_mode" in
+            sync)
+              # require_curl inside this arm only (curl-free for other types).
+              require_curl
+
+              # Test seam: OSL_WEBHOOK_STUB="<code>:<body>" skips the real call.
+              local wh_resp_code="" wh_resp_body=""
+              if [[ -n "${OSL_WEBHOOK_STUB:-}" ]]; then
+                wh_resp_code="${OSL_WEBHOOK_STUB%%:*}"
+                wh_resp_body="${OSL_WEBHOOK_STUB#*:}"
+              else
+                # Real curl call.
+                local wh_curl_tmp; wh_curl_tmp="$(mktemp)"
+                local wh_curl_args=(-sS -X "$wh_method" "$wh_url"
+                  -o "$wh_curl_tmp" -w "%{http_code}")
+
+                # Inject headers.
+                local wh_hdr_n; wh_hdr_n="$(jq 'length' <<<"$wh_headers_json")"
+                local wh_h_i=0
+                while [[ "$wh_h_i" -lt "$wh_hdr_n" ]]; do
+                  local wh_h_k wh_h_v
+                  wh_h_k="$(jq -r "keys_unsorted[$wh_h_i]" <<<"$wh_headers_json")"
+                  # [MEDIUM/SECURITY] CRLF guard on header key at dispatch time.
+                  # Keys already passed the render-loop guard above; this is a
+                  # belt-and-suspenders check in case wh_headers_json was built
+                  # from an alternate path in the future.
+                  if [[ "$wh_h_k" == *$'\r'* || "$wh_h_k" == *$'\n'* ]]; then
+                    out_raw='{"error":"security: CRLF characters in header key name — refusing to send"}'; rc=1; wh_ok=false; break
+                  fi
+                  wh_h_v="$(jq -r --arg k "$wh_h_k" '.[$k]' <<<"$wh_headers_json")"
+                  wh_curl_args+=(-H "$wh_h_k: $wh_h_v")
+                  wh_h_i=$(( wh_h_i + 1 ))
+                done
+
+                # Body (not for GET/DELETE).
+                case "$wh_method" in
+                  GET|DELETE) ;;
+                  *)          wh_curl_args+=(--data-raw "$wh_body") ;;
+                esac
+
+                if ! wh_resp_code="$(curl "${wh_curl_args[@]}" 2>>"$run_dir/$sid.stderr.log")"; then
+                  rm -f "$wh_curl_tmp"
+                  out_raw='{"error":"curl failed for webhook step"}'; rc=1; wh_ok=false
+                else
+                  wh_resp_body="$(cat "$wh_curl_tmp")"; rm -f "$wh_curl_tmp"
+                fi
+              fi
+
+              if [[ "$wh_ok" == true ]]; then
+                # 2xx check (matches raise_unless_success!).
+                if [[ "$wh_resp_code" -lt 200 || "$wh_resp_code" -ge 300 ]]; then
+                  local wh_trunc; wh_trunc="${wh_resp_body:0:300}"
+                  out_raw="{\"error\":\"sync webhook HTTP $wh_resp_code: $wh_trunc\"}"; rc=1; wh_ok=false
+                fi
+              fi
+
+              if [[ "$wh_ok" == true ]]; then
+                # Parse response body as a JSON object (matches parse_response).
+                local wh_resp_stripped; wh_resp_stripped="$(printf '%s' "$wh_resp_body" | tr -d '[:space:]')"
+                if [[ -z "$wh_resp_stripped" ]]; then
+                  # Empty body → {} (matches "return {} if body.strip.empty?").
+                  out_raw="{}"; rc=0
+                elif ! out_raw="$(jq -e 'if type=="object" then . else error("not a JSON object") end' <<<"$wh_resp_body" 2>/dev/null)"; then
+                  out_raw="{\"error\":\"sync webhook response is not a valid JSON object — got: ${wh_resp_body:0:300}\"}"; rc=1; wh_ok=false
+                else
+                  rc=0
+                fi
+              fi ;;
+
+            callback)
+              # Callback mode: pause the run. The callback id was already generated
+              # above (wh_cb_id) so ${callback_url} in url/headers/body resolved to
+              # a real non-empty id. Store it in the waiting block so the caller can
+              # resume via: opensop submit <run_id> <step-id> --local --output k=v ...
+              # NOTE: there is no inbound HTTP receiver in the local backend — the
+              # third party cannot post to us. The operator resumes manually.
+              # This is intentional and documented: the local engine is not a server.
+              jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg ex "$sexec" \
+                     --arg a "$s_started" --arg cb "$wh_cb_id" \
+                '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:"waiting",
+                  reason:"waiting_for_callback", callback_id:$cb, started_at:$a}' >> "$audit"
+              echo "waiting:$i"
+              return 0 ;;
+          esac
+        fi ;;
+      subprocess)
+        # Subprocess step — CLI EXCEEDS the runtime (runtime only stubs it).
+        #
+        # Fields:
+        #   process (required): logical name (resolved via _find_skill_in_cells)
+        #            or an explicit path (contains '/' or ends in .sop.json).
+        #   inputs  (optional): array of {name, from} mappings. Each entry maps
+        #            a child input name to a parent context reference. References
+        #            are resolved against the parent's current context:
+        #              - "inputs.X"         → ctx["process"]["inputs"]["X"]  (NOT
+        #                                     implemented as a deep path; left as
+        #                                     the literal key in the parent context)
+        #              - "steps.X.outputs.Y" → ctx["X"]["Y"]
+        #              - bare value          → passed as a literal string
+        #            For simplicity we support the two most common dot-path shapes:
+        #            "steps.<id>.outputs.<field>" and "<stepid>.<field>" (bare ctx
+        #            path). Both resolve via jq against the parent context.
+        #
+        # Recursion guard: OSL_DEPTH (env int, starts at 0). Increment on entry;
+        # refuse at >= 16 (mirrors a typical stack-depth safety valve).
+        #
+        # Run dir: <parent_run_dir>/subprocess/<step-id>/ — inspectable, isolated.
+        #
+        # Result mapping:
+        #   child completed → out_raw = child's final context.json merged under step_id
+        #                               (i.e. {<child_output_keys>:...})
+        #   child waiting   → propagate as parent waiting_for_callback; record child run_id
+        #   child failed    → rc=1, out_raw = error message (continue_on_error applies)
+        #
+        # DESIGN NOTE: uses the same sentinel pattern (sp_ok=false) — never bare
+        # `break` inside case/while.
+        local sp_ok=true sp_proc_arg sp_child_file sp_inputs_arr sp_child_ctx
+        sp_proc_arg="$(jq -r '.process // ""' <<<"$step")"
+        if [[ -z "$sp_proc_arg" ]]; then
+          out_raw='{"error":"subprocess step is missing required field: process"}'; rc=1; sp_ok=false
+        fi
+
+        # Recursion depth guard.
+        if [[ "$sp_ok" == true ]]; then
+          local sp_depth="${OSL_DEPTH:-0}"
+          if [[ "$sp_depth" -ge 16 ]]; then
+            out_raw="{\"error\":\"subprocess recursion depth limit reached ($sp_depth >= 16) — possible self-reference?\"}"; rc=1; sp_ok=false
+          fi
+        fi
+
+        # Resolve the child process file — same logic as local_run.
+        if [[ "$sp_ok" == true ]]; then
+          if [[ "$sp_proc_arg" == *.sop.json ]] || [[ "$sp_proc_arg" == */* ]]; then
+            sp_child_file="$sp_proc_arg"
+          else
+            sp_child_file="$(_find_skill_in_cells "$sp_proc_arg")"
+          fi
+          if [[ -z "$sp_child_file" || ! -f "$sp_child_file" ]]; then
+            out_raw="{\"error\":\"subprocess: process file not found: $sp_proc_arg\"}"; rc=1; sp_ok=false
+          fi
+        fi
+
+        # Build child inputs from the inputs[] mapping against the parent context.
+        # inputs[] array entries: {name, from} where from is a dot-path into ctx.
+        # Supported from patterns:
+        #   "steps.<id>.outputs.<field>" → ctx["<id>"]["<field>"]
+        #   "<id>.<field>"               → ctx["<id>"]["<field>"]  (shorthand)
+        #   "<id>"                       → ctx["<id>"]             (whole step output)
+        #   literal (no dot match)       → pass as string literal
+        if [[ "$sp_ok" == true ]]; then
+          sp_inputs_arr="$(jq -c '.inputs // []' <<<"$step")"
+          sp_child_ctx="$(jq -cn \
+            --argjson parent_ctx "$ctx" \
+            --argjson inp_map "$sp_inputs_arr" '
+            # Resolve a "from" reference against the parent context.
+            def resolve_ref(ref; pctx):
+              if ref | startswith("steps.") and (ref | split(".") | length >= 4) then
+                # steps.<id>.outputs.<field> — extract id and field
+                (ref | split(".")) as $parts |
+                pctx[$parts[1]][$parts[3]]
+              elif ref | test("^[a-zA-Z_][a-zA-Z0-9_-]*\\.[a-zA-Z_][a-zA-Z0-9_-]*$") then
+                # <stepid>.<field> shorthand
+                (ref | split(".")) as $parts |
+                pctx[$parts[0]][$parts[1]]
+              elif pctx[ref] != null then
+                pctx[ref]
+              else
+                ref  # literal string fallback
+              end;
+            $inp_map | map(
+              select(.name != null) |
+              {key: .name, value: (resolve_ref((.from // .name); $parent_ctx))}
+            ) | from_entries
+          ')"
+        fi
+
+        # Create the child run dir and run the subprocess.
+        # Child runs are stored at $OPENSOP_LOCAL_HOME/runs/<child_run_id>/ — a flat
+        # sibling of the parent run, not nested inside it. This prevents exponentially
+        # growing paths when subprocesses recurse. The parent audit receipt records
+        # child_run_id so the operator can inspect via `opensop show <child_run_id>`.
+        # A symlink <parent_run>/subprocess/<step-id> → child_run_dir is also created
+        # for at-a-glance inspectability without navigating the flat list.
+        if [[ "$sp_ok" == true ]]; then
+          local sp_child_run_id; sp_child_run_id="$(_local_run_id)-sp-$sid"
+          local sp_child_run_dir="$OPENSOP_LOCAL_HOME/runs/$sp_child_run_id"
+          mkdir -p "$sp_child_run_dir"
+          # Create a symlink in the parent's run dir for convenient inspection.
+          local sp_symlink_dir="$run_dir/subprocess/$sid"
+          mkdir -p "$sp_symlink_dir"
+          ln -sfn "$sp_child_run_dir" "$sp_symlink_dir/$sp_child_run_id" 2>/dev/null || true
+
+          # Run the child process in a subshell with incremented depth,
+          # overriding OPENSOP_LOCAL_HOME to route its receipts into the nested dir.
+          # We capture the manifest JSON from the child and inspect its status.
+          local sp_child_name; sp_child_name="$(jq -r '.name // "unnamed"' "$sp_child_file")"
+          local sp_child_started; sp_child_started="$(_local_now)"
+          local sp_depth_next; sp_depth_next=$(( ${OSL_DEPTH:-0} + 1 ))
+
+          # Write child manifest (mirrors local_run's initial manifest write).
+          jq -nc \
+            --arg n "$sp_child_name" \
+            --arg p "$sp_child_file" \
+            --arg id "$sp_child_run_id" \
+            --arg t "$sp_child_started" \
+            --argjson inp "$sp_child_ctx" \
+            '{run_id:$id, process:$n, process_file:$p, started_at:$t, status:"running", inputs:$inp}' \
+            > "$sp_child_run_dir/manifest.json"
+
+          # Run the child step loop directly (reuse _local_step_loop, no subshell overhead).
+          # Override OSL_DEPTH for any nested subprocess calls.
+          local sp_loop_status
+          sp_loop_status="$(OSL_DEPTH="$sp_depth_next" \
+            _local_step_loop "$sp_child_run_dir" "$sp_child_file" 0 "$sp_child_ctx")"
+
+          case "$sp_loop_status" in
+            completed)
+              # Merge child's final context under the step id.
+              local sp_final_ctx
+              if [[ -f "$sp_child_run_dir/context.json" ]]; then
+                sp_final_ctx="$(cat "$sp_child_run_dir/context.json")"
+              else
+                sp_final_ctx="$sp_child_ctx"
+              fi
+              # Record child as completed in its manifest.
+              local sp_child_ended; sp_child_ended="$(_local_now)"
+              jq -c --arg s "completed" --arg e "$sp_child_ended" '.status=$s | .ended_at=$e' \
+                "$sp_child_run_dir/manifest.json" > "$sp_child_run_dir/manifest.json.tmp" \
+                && mv "$sp_child_run_dir/manifest.json.tmp" "$sp_child_run_dir/manifest.json"
+              # out_raw = child's final context (the whole context object is the step output).
+              out_raw="$sp_final_ctx"; rc=0 ;;
+
+            failed)
+              local sp_child_ended2; sp_child_ended2="$(_local_now)"
+              jq -c --arg s "failed" --arg e "$sp_child_ended2" '.status=$s | .ended_at=$e' \
+                "$sp_child_run_dir/manifest.json" > "$sp_child_run_dir/manifest.json.tmp" \
+                && mv "$sp_child_run_dir/manifest.json.tmp" "$sp_child_run_dir/manifest.json"
+              out_raw="{\"error\":\"subprocess '$sp_proc_arg' failed (see $sp_child_run_dir/)\"}"; rc=1; sp_ok=false ;;
+
+            waiting:*)
+              # Child paused — propagate as a parent waiting_for_callback pause.
+              # Record the child run_id and the child run dir so the operator can inspect.
+              local sp_wait_index; sp_wait_index="${sp_loop_status#waiting:}"
+              local sp_wait_step; sp_wait_step="$(jq -r ".steps[$sp_wait_index].id // \"step-$sp_wait_index\"" "$sp_child_file")"
+              local sp_wait_since; sp_wait_since="$(_local_now)"
+
+              # Finalize child manifest as waiting.
+              jq -c --arg s "waiting" \
+                    --argjson idx "$(( sp_wait_index + 1 ))" \
+                    --argjson widx "$sp_wait_index" \
+                    --arg step "$sp_wait_step" \
+                 '.status=$s | .cursor={next_index:$idx} | .waiting={step:$step, index:$widx, reason:"waiting_for_callback", since:"'"$sp_wait_since"'"}' \
+                "$sp_child_run_dir/manifest.json" > "$sp_child_run_dir/manifest.json.tmp" \
+                && mv "$sp_child_run_dir/manifest.json.tmp" "$sp_child_run_dir/manifest.json"
+
+              # Append a waiting audit receipt for this parent step.
+              jq -nc --arg rid "$run_id" --arg sid "$sid" --arg t "$stype" --arg ex "$sexec" \
+                     --arg a "$s_started" --arg crid "$sp_child_run_id" --arg crdir "$sp_child_run_dir" \
+                '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:"waiting",
+                  reason:"waiting_for_callback", child_run_id:$crid, child_run_dir:$crdir, started_at:$a}' >> "$audit"
+              echo "waiting:$i"
+              return 0 ;;
+
+            *)
+              out_raw="{\"error\":\"subprocess: unexpected loop status: $sp_loop_status\"}"; rc=1; sp_ok=false ;;
+          esac
+        fi ;;
       *)    out_raw="unsupported step type for local execution: $stype"; rc=2 ;;
     esac
 
@@ -1924,27 +2773,234 @@ local_run() {
 
     if [ "$rc" -eq 0 ]; then
       ctx="$(jq -c --arg id "$sid" --argjson o "$out_json" '.[$id]=$o' <<<"$ctx")"
+      # Live checkpoint: atomic write (temp+mv) so a truncated write never silently
+      # strips outputs — a future resume can re-enter at the cursor safely.
+      printf '%s' "$ctx" > "$run_dir/context.json.tmp" && mv "$run_dir/context.json.tmp" "$run_dir/context.json"
     else
       [[ "$OUTPUT_MODE" != json ]] && err "[$sid] failed (exit $rc): $(jq -rc '.stdout // .' <<<"$out_json" | head -c 160)"
-      if [ "$scont" != "true" ]; then run_status="failed"; break; fi
+      if [ "$scont" != "true" ]; then echo "failed"; return 0; fi
       ctx="$(jq -c --arg id "$sid" --argjson o "$out_json" '.[$id]=$o' <<<"$ctx")"
+      printf '%s' "$ctx" > "$run_dir/context.json.tmp" && mv "$run_dir/context.json.tmp" "$run_dir/context.json"
     fi
     i=$((i+1))
   done
 
+  echo "completed"
+}
+
+# opensop submit <run_id> <step-id> --local [--output k=v ...] [--outputs '<json>'] [--decided-by WHO]
+#
+# Resume a paused local run at the step named <step-id>. Validates submitted
+# outputs against the step's declared schema, injects them into context, appends
+# a completion receipt to audit.jsonl, then re-enters _local_step_loop from
+# cursor.next_index onward. Finalizes manifest on completion/failure.
+#
+# Pre-conditions (all die on violation):
+#   - run dir + manifest exist
+#   - manifest.status == "waiting"
+#   - manifest.waiting.step == <step-id>
+#   - all required output fields are present and type-valid
+#
+# Contract: never re-runs steps at index < cursor.next_index (idempotency).
+local_submit() {
+  [[ $# -lt 2 ]] && die "usage: opensop submit <run_id> <step-id> --local [--output KEY=VALUE ...] [--outputs '<json>'] [--decided-by WHO]" "usage_error" "run opensop help"
+  local run_id="$1" step_id="$2"; shift 2
+
+  local run_dir="$OPENSOP_LOCAL_HOME/runs/$run_id"
+  [ -d "$run_dir" ] || die "no such local run: $run_id (see: opensop runs)" "instance_not_found" "opensop runs"
+  local mf="$run_dir/manifest.json"
+  [ -f "$mf" ] || die "run directory found but manifest.json is missing: $run_dir" "cli_error"
+
+  # Status gate: only waiting runs can be resumed.
+  local mf_status; mf_status="$(jq -r '.status' "$mf")"
+  [ "$mf_status" = "waiting" ] || die "run $run_id is '$mf_status', not 'waiting' — cannot submit" "usage_error" "only waiting runs can be submitted"
+
+  # Step gate: must be waiting on exactly this step.
+  local waiting_step; waiting_step="$(jq -r '.waiting.step // ""' "$mf")"
+  [ "$waiting_step" = "$step_id" ] || die "run $run_id is waiting on '$waiting_step', not '$step_id'" "usage_error" "submit step id must match manifest.waiting.step"
+
+  # Parse submitted outputs.
+  local built; built="$(build_payload_object output "$@")"
+  local submitted; submitted="$(jq -c '.payload' <<<"$built")"
+  local decided_by; decided_by="$(jq -r '.decided_by' <<<"$built")"
+
+  # Validate submitted outputs against manifest.waiting.expects.schema.
+  # Reuse the same required/enum/type logic as the dry-run validator.
+  #
+  # required_if PARITY: the runtime's validate_outputs! (instance_executor.rb ~:319)
+  # supports required_if — a field required only when a condition holds against
+  # the submitted outputs. The local validator CANNOT evaluate arbitrary condition
+  # expressions (no ConditionEvaluator here), so we skip the unconditional required
+  # check for any field that declares required_if. This is intentionally permissive —
+  # "never more restrictive than the server" — and documented as a local limitation.
+  local schema; schema="$(jq -c '.waiting.expects.schema // []' "$mf")"
+  local errors_json
+  errors_json="$(jq -cn --argjson schema "$schema" --argjson supplied "$submitted" '
+    [ $schema[] |
+      . as $field |
+      ($supplied[$field.name]) as $val |
+      # required check: skip entirely when required_if is present (local cannot
+      # evaluate the condition — treat as optional, never more strict than server).
+      (if ($field.required == true) and ($field.required_if == null) and ($val == null) then
+        {path: ("outputs." + $field.name), message: ("required field missing: " + $field.name)}
+      else null end),
+      (if $val != null then
+        if   $field.type == "number"  and ($val | type) != "number"  then
+          {path: ("outputs." + $field.name), message: ($field.name + " must be a number")}
+        elif $field.type == "boolean" and ($val | type) != "boolean" then
+          {path: ("outputs." + $field.name), message: ($field.name + " must be a boolean")}
+        elif $field.type == "enum" and ($field.values != null) and ([$field.values[] | . == $val] | any | not) then
+          {path: ("outputs." + $field.name), message: ($field.name + " must be one of: " + ($field.values | join(", ")))}
+        elif $field.type == "string" and $field.format == "email" and ($val | type) == "string" and ($val | test("^[^@]+@[^@]+\\.[^@]+$") | not) then
+          {path: ("outputs." + $field.name), message: ($field.name + " does not look like an email address")}
+        else null end
+      else null end)
+    ] | map(select(. != null))
+  ')"
+  local err_count; err_count="$(jq 'length' <<<"$errors_json")"
+  if (( err_count > 0 )); then
+    local first_err; first_err="$(jq -r '.[0].message' <<<"$errors_json")"
+    die "validation failed: $first_err" "usage_error" "$(jq -r '.[].message' <<<"$errors_json" | head -5 | tr '\n' '; ')"
+  fi
+
+  # Locate the process file so we can resume execution.
+  local proc_file; proc_file="$(jq -r '.process_file' "$mf")"
+  [ -f "$proc_file" ] || die "process file not found: $proc_file (was the run created on another machine?)" "file_not_found"
+
+  # Resolve the cursor: cursor.next_index already points to the first step to run
+  # on resume (it was stored as wait_index + 1 when the run paused). Read it
+  # directly — no +1 offset needed here.
+  local wait_index; wait_index="$(jq -r '.waiting.index' "$mf")"
+  local resume_index; resume_index="$(jq -r '.cursor.next_index' "$mf")"
+
+  # Load current context (already checkpointed after all completed steps).
+  local ctx
+  if [ -f "$run_dir/context.json" ]; then
+    ctx="$(cat "$run_dir/context.json")"
+  else
+    ctx="$(jq -c '.inputs // {}' "$mf")"
+  fi
+
+  # Inject the submitted outputs under the step id (same merge shape as local_run ~:1926).
+  local out_json
+  if jq -e . >/dev/null 2>&1 <<<"$submitted"; then
+    out_json="$(jq -c 'if type=="object" then . else {value:.} end' <<<"$submitted")"
+  else
+    out_json="$(jq -nc --arg s "$submitted" '{stdout:$s}')"
+  fi
+  ctx="$(jq -c --arg id "$step_id" --argjson o "$out_json" '.[$id]=$o' <<<"$ctx")"
+
+  # Append a completed receipt for the step we're resuming from.
+  # Derive type + executor dynamically from the process file (matches _local_step_loop
+  # receipts). The executor uses the same per-type default logic as the step loop.
+  local resumed_stype; resumed_stype="$(jq -r ".steps[$wait_index].type // \"automated\"" "$proc_file")"
+  local resumed_sexec; resumed_sexec="$(jq -r ".steps[$wait_index].executor // \"\"" "$proc_file")"
+  if [[ -z "$resumed_sexec" ]]; then
+    case "$resumed_stype" in
+      automated|shell|webhook)                                               resumed_sexec="external" ;;
+      noop|form|approval|notification|wait|judgment|llm|subprocess) resumed_sexec="internal" ;;
+      *)                                                                      resumed_sexec="external" ;;
+    esac
+  fi
+  local audit="$run_dir/audit.jsonl"
+  local submitted_at; submitted_at="$(_local_now)"
+  jq -nc \
+    --arg rid "$run_id" --arg sid "$step_id" --arg t "$resumed_stype" --arg ex "$resumed_sexec" \
+    --arg a "$submitted_at" --arg b "$submitted_at" \
+    --argjson out "$out_json" \
+    --arg db "$decided_by" \
+    '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:"completed",
+      exit_code:0, started_at:$a, ended_at:$b, output:$out}
+     + (if $db != "" then {decided_by:$db} else {} end)' >> "$audit"
+
+  # Update context.json checkpoint with the submitted data (atomic write).
+  printf '%s' "$ctx" > "$run_dir/context.json.tmp" && mv "$run_dir/context.json.tmp" "$run_dir/context.json"
+
+  # Flip manifest back to running and clear the waiting block before re-entering the loop.
+  jq -c '.status="running" | del(.waiting) | del(.cursor)' \
+     "$mf" > "$mf.tmp" && mv "$mf.tmp" "$mf"
+
+  # Safety net: if we crash mid-resume, mark interrupted (not left as running).
+  trap '_local_finalize_trap "$run_dir"' EXIT
+
+  # Re-enter the step loop at resume_index (NEVER re-runs steps < resume_index).
+  local loop_status
+  loop_status="$(_local_step_loop "$run_dir" "$proc_file" "$resume_index" "$ctx")"
+
+  local run_status
+  case "$loop_status" in
+    completed) run_status="completed" ;;
+    failed)    run_status="failed" ;;
+    waiting:*) run_status="waiting" ;;
+    *)         run_status="failed" ;;
+  esac
+
+  [ -f "$run_dir/context.json" ] || echo "$ctx" > "$run_dir/context.json"
+
+  if [ "$run_status" = "waiting" ]; then
+    # Another pause point hit during resume.
+    local wait_index2; wait_index2="${loop_status#waiting:}"
+    local wait_step2 wait_since2
+    wait_step2="$(jq -r ".steps[$wait_index2].id // \"step-$wait_index2\"" "$proc_file")"
+    wait_since2="$(_local_now)"
+    local wait_expects2
+    wait_expects2="$(jq -c --argjson idx "$wait_index2" '
+      .steps[$idx] as $s |
+      ($s.inputs // $s.outputs // null) as $decl |
+      if $decl != null and ($decl | length) > 0 then
+        { outputs: [$decl[].name // empty],
+          schema:  $decl }
+      elif $s.type == "approval" then
+        { outputs: ["decision"],
+          schema:  [{"name":"decision","type":"enum","values":["approve","reject"],"required":true}] }
+      else
+        { outputs: [], schema: [] }
+      end
+    ' "$proc_file")"
+    local wait_stype2 wait_reason2
+    wait_stype2="$(jq -r ".steps[$wait_index2].type // \"automated\"" "$proc_file")"
+    case "$wait_stype2" in
+      form)     wait_reason2="waiting_for_input" ;;
+      approval) wait_reason2="waiting_for_approval" ;;
+      *)        wait_reason2="waiting_for_callback" ;;
+    esac
+    jq -c --arg s "waiting" \
+          --argjson idx "$((wait_index2 + 1))" \
+          --argjson widx "$wait_index2" \
+          --arg step "$wait_step2" \
+          --arg reason "$wait_reason2" \
+          --arg since "$wait_since2" \
+          --argjson expects "$wait_expects2" \
+       '.status=$s
+        | .cursor={next_index:$idx}
+        | .waiting={step:$step, index:$widx, reason:$reason, expects:$expects, since:$since}' \
+       "$mf" > "$mf.tmp" && mv "$mf.tmp" "$mf"
+    trap - EXIT
+    if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+      ok "submitted $step_id — run $run_id now waiting at $wait_step2"
+      info "next:  opensop submit $run_id $wait_step2 --local --output k=v"
+    else
+      jq -c . "$mf"
+    fi
+    return 0
+  fi
+
   local ended; ended="$(_local_now)"
-  echo "$ctx" > "$run_dir/context.json"
   jq -c --arg s "$run_status" --arg e "$ended" '.status=$s | .ended_at=$e' \
-     "$run_dir/manifest.json" > "$run_dir/manifest.json.tmp" && mv "$run_dir/manifest.json.tmp" "$run_dir/manifest.json"
-  trap - EXIT    # finalized normally; drop the interrupted-run safety net
+     "$mf" > "$mf.tmp" && mv "$mf.tmp" "$mf"
+  trap - EXIT
 
   if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
-    if [ "$run_status" = completed ]; then ok "ran $C_BOLD$name$C_RESET locally — completed"; else err "ran $name locally — failed"; fi
+    local proc_name; proc_name="$(jq -r '.process' "$mf")"
+    if [ "$run_status" = completed ]; then
+      ok "submitted $step_id — $C_BOLD$proc_name$C_RESET completed"
+    else
+      err "submitted $step_id — $proc_name failed"
+    fi
     info "  run: $run_id"
-    info "  dir: $run_dir"
     info "next:  opensop show $run_id"
   else
-    jq -c . "$run_dir/manifest.json"
+    jq -c . "$mf"
   fi
   [ "$run_status" = completed ]
 }
