@@ -13,6 +13,18 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ## [0.7.0] — unreleased
 
+### Changed
+
+- **`webhook` `response_mode` is now required** (no default). Omitting it is a
+  validation error in both `schema validate` and the local engine — removes the
+  prior silent local-`sync` / runtime-`callback` divergence.
+- **`webhook` callback mode fires the outbound request, then pauses** (runtime
+  parity), instead of pausing without notifying the endpoint.
+- **`webhook` fallback body (no `body_template`) resolves declared step inputs
+  via `from:`** (InputResolver parity) instead of a bare context lookup — no
+  longer over-shares the full accumulated context to the endpoint.
+- **`${process.inputs.X}` supports nested dot-paths** in webhook templates.
+
 ### Added
 
 - **`subprocess` step type — recursive local execution (U8).**
