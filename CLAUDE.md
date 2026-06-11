@@ -16,13 +16,13 @@ shellcheck bin/opensop          # lint (optional; see known warnings below)
 bin/opensop --version           # must equal OPENSOP_CLI_VERSION at bin/opensop:19
 ```
 
-- **Tests:** `test/test.sh` is a plain bash script, not a framework — it runs the `examples/greet.sop.json` process through `bin/opensop --local` and asserts on receipts. There is no per-test selector; to exercise one path, craft a small `.sop.json` and run `bin/opensop run <file> --local --json` the way the test does. It needs only `bash` + `jq` (no server, no curl). Always extend it when you touch the local engine — cover the **failure path**, not just the happy path (a happy-path-only test once hid a critical `set -e` bug).
+- **Tests:** `test/test.sh` is a plain bash script, not a framework — it runs the `examples/greet.sop.json` process through `bin/opensop` and asserts on receipts. There is no per-test selector; to exercise one path, craft a small `.sop.json` and run `bin/opensop run <file> --json` the way the test does. It needs only `bash` + `jq` (no server, no curl). Always extend it when you touch the local engine — cover the **failure path**, not just the happy path (a happy-path-only test once hid a critical `set -e` bug).
 - **There is no CI.** `bash -n bin/opensop && bash test/test.sh` is the only gate, and it is manual — run it yourself before committing; nothing else will.
 - **Known shellcheck warnings** are pre-existing and not blockers: `C_CYAN` unused, and `SC2254` (unquoted `$plural`/`$noun` in `build_payload_object`'s `case`). Don't "fix" these without intent.
 
 ## Architecture
 
-**Two backends behind one CLI.** Every command is dispatched from `main()` (bottom of the file). The default backend is **remote**: commands build a request and call `api_call` (the single curl chokepoint) against a configured server's `/sop/*` REST API. The `--local` flag sets `LOCAL_MODE=true` and selects the **local execution engine** instead — no server, no network, no curl. `cmd_run` and `cmd_list` branch to `local_run`/`local_list` at their top when `LOCAL_MODE`; `runs` and `show` are *always* local. Understanding any feature means knowing which backend it lives in.
+**Two backends behind one CLI.** Every command is dispatched from `main()` (bottom of the file). The default backend is **local** (v0.8+): commands run against local `.sop.json` files with no server, no network, no curl. `--remote` or `--server <url>` sets `REMOTE_MODE=true` and routes dual commands to call `api_call` (the single curl chokepoint) against a configured server's `/sop/*` REST API. `--local` is a deprecated no-op (local is now the default) — still accepted for script compatibility. Dual commands branch at their top: `if [[ "$REMOTE_MODE" != true ]]; then local_X "$@"; return $?; fi`. `runs` and `show` are always local. Understanding any feature means knowing which backend it lives in.
 
 **File layout** (banner sections, in order): constants → output/error helpers → config → HTTP core (`api_call`) → local instance cache → one `cmd_*` per subcommand → the local execution engine (`local_*`) → `main()` dispatch.
 

@@ -5,10 +5,10 @@ You are an AI coding agent (Claude Code, Codex, Cursor, etc.) that a user has as
 ## What you're installing
 
 `opensop-cli` — a single bash file that:
-- talks to OpenSOP server runtimes via the `/sop/*` HTTP API (default behavior), AND
-- runs processes locally with no server via `--local` (offline-capable)
+- runs processes locally with no server (default behavior — no daemon, no curl required), AND
+- talks to OpenSOP server runtimes via the `/sop/*` HTTP API when `--remote` or `--server <url>` is passed
 
-There is no compiled artifact, no package manager, no daemon. The file *is* the binary. Current version: **0.6.0** (the cell substrate release).
+There is no compiled artifact, no package manager, no daemon. The file *is* the binary. Current version: **0.8.0** (local-first default).
 
 Source of truth: <https://github.com/Chosen9115/opensop-cli> · Releases: <https://github.com/Chosen9115/opensop-cli/releases>
 
@@ -55,11 +55,11 @@ sudo chmod +x /usr/local/bin/opensop
 ## Step 3 — Verify the install
 
 ```bash
-opensop --version  # must print: opensop 0.6.0
-opensop --help     # must show the help text; verify the "CELLS (v0.6 — fractal addressing)" section is present
+opensop --version  # must print: opensop 0.8.0
+opensop --help     # must show the help text; verify the "LOCAL EXECUTION (default — no server required)" section is present
 ```
 
-If `--version` reports something other than `0.6.0`, the install pulled an older cached version — re-run Step 2.
+If `--version` reports something other than `0.8.0`, the install pulled an older cached version — re-run Step 2.
 
 If `opensop` is not found on `PATH` after install, you installed to a directory the shell doesn't know about. Check `which opensop` and add the directory to `PATH` accordingly.
 
@@ -67,11 +67,24 @@ If `opensop` is not found on `PATH` after install, you installed to a directory 
 
 [ASK] Two paths. Ask the user which they want, and execute the matching subsection:
 
-**A. Remote server** — the user has (or plans to have) an OpenSOP server running and wants the CLI to talk to it.
+**A. Local mode** — no server needed. The user wants to author and run processes on-machine (the default in v0.8+).
 
-**B. Local mode** — no server. The user wants to author and run processes on-machine, optionally using the v0.6 cell primitive for organization.
+**B. Remote server** — the user has (or plans to have) an OpenSOP server running and wants the CLI to talk to it.
 
-### Path A — point at a server
+### Path A — local mode (default; recommended for first-time exploration)
+
+No config needed. The CLI runs processes locally out of the box. To organize processes using the v0.6 cell primitive (directory-scoped resolution + lineage tracking), pick a directory to root the user's "workspace cell" in:
+
+[ASK] Ask the user where they want their OpenSOP workspace to live (a sensible default: `~/opensop`). Then:
+
+```bash
+mkdir -p <WORKSPACE_DIR>
+cd <WORKSPACE_DIR>
+opensop init                              # creates .opensop/manifest.yaml — this directory is now an OpenSOP "cell"
+opensop scope                             # confirms the cell is recognized
+```
+
+### Path B — point at a remote server
 
 ```bash
 opensop config set url <SERVER_URL>     # e.g., https://demo.opensop.ai
@@ -83,27 +96,14 @@ opensop config set token <API_TOKEN>    # the server-issued API token
 Verify:
 
 ```bash
-opensop list                              # should list registered processes from the server
-```
-
-### Path B — local mode (recommended for first-time exploration)
-
-No config needed for plain `--local` usage. To unlock the v0.6 cell primitive (organize processes by directory + walk-up resolution + lineage tracking), pick a directory to root the user's "workspace cell" in:
-
-[ASK] Ask the user where they want their OpenSOP workspace to live (a sensible default: `~/opensop`). Then:
-
-```bash
-mkdir -p <WORKSPACE_DIR>
-cd <WORKSPACE_DIR>
-opensop init                              # creates .opensop/manifest.yaml — this directory is now an OpenSOP "cell"
-opensop scope                             # confirms the cell is recognized
+opensop --remote list                     # should list registered processes from the server
 ```
 
 ## Step 5 — Walk the user through one working example
 
 Drop a tiny example process and run it, so the user sees the CLI work end-to-end before you sign off.
 
-For Path A (server mode), if their server already has processes, use one of those — `opensop list` will show the catalog. For Path B (local mode):
+For Path B (server mode), if their server already has processes, use one of those — `opensop --remote list` will show the catalog. For Path A (local mode):
 
 ```bash
 mkdir -p <WORKSPACE_DIR>/processes
@@ -114,7 +114,7 @@ JSON
 
 cd <WORKSPACE_DIR>
 opensop list                              # should show: [<workspace-name>]  hello  <path>
-opensop run hello --local                 # runs the process; receipt lands in <WORKSPACE_DIR>/.opensop/runs/
+opensop run hello                         # runs the process; receipt lands in <WORKSPACE_DIR>/.opensop/runs/
 opensop runs                              # lists the run
 ```
 
@@ -126,13 +126,13 @@ Tell the user, in plain text:
 - Where it was installed (`which opensop`)
 - Which path they're set up for (A: server URL; B: workspace cell path)
 - One next-step suggestion based on their path:
-  - Path A: "Try `opensop search <keyword>` to find processes, or `opensop schema <name>` to inspect one."
-  - Path B: "Edit `processes/*.sop.json` in your workspace to author processes. `opensop run <name> --local` runs them. `opensop init` in a subfolder creates a nested cell that inherits processes from this one."
-- Where to read more: `opensop help`, the [README](https://github.com/Chosen9115/opensop-cli#readme), or the [v0.6 release notes](https://github.com/Chosen9115/opensop-cli/releases/tag/v0.6.0).
+  - Path A: "Edit `processes/*.sop.json` in your workspace to author processes. `opensop run <name>` runs them. `opensop init` in a subfolder creates a nested cell that inherits processes from this one."
+  - Path B: "Try `opensop --remote search <keyword>` to find processes, or `opensop --remote schema <name>` to inspect one. Add `--remote` to any command to route it to the configured server."
+- Where to read more: `opensop help`, the [README](https://github.com/Chosen9115/opensop-cli#readme), or the [v0.8.0 release notes](https://github.com/Chosen9115/opensop-cli/releases/tag/v0.8.0).
 
 ## Trust boundary (read this before running anything you didn't author)
 
-Local steps in a `.sop.json` execute **arbitrary shell on the host machine** — same posture as a `Makefile` or an npm `postinstall` script. If you (the agent) are asked to `opensop run --local` a process file the user has not personally authored or vetted, treat it as you would running an unknown shell script: stop and ask the user to confirm. Do not silently fetch and run `.sop.json` files from URLs.
+Local steps in a `.sop.json` execute **arbitrary shell on the host machine** — same posture as a `Makefile` or an npm `postinstall` script. If you (the agent) are asked to `opensop run` a process file the user has not personally authored or vetted, treat it as you would running an unknown shell script: stop and ask the user to confirm. Do not silently fetch and run `.sop.json` files from URLs.
 
 ## Common issues + how to handle them
 
@@ -142,7 +142,7 @@ Local steps in a `.sop.json` execute **arbitrary shell on the host machine** —
 | `declare: -A: invalid option` while running a v0.6 cell-aware command | bash 3.x in use | Install bash 4+ (`brew install bash`) and re-run; the shebang `#!/usr/bin/env bash` picks the first `bash` in PATH |
 | `jq: command not found` | jq missing | Install via `brew install jq` / `apt install -y jq` |
 | `Permission denied` on `/usr/local/bin/opensop` | Filesystem perms or SIP | Use the `~/.local/bin/opensop` fallback in Step 2 |
-| `(server not configured)` on `opensop list` | No URL set | If Path A: re-run Step 4A. If Path B: add `--local` to commands. |
+| `config_missing` error on `opensop --remote list` | No URL set | Run `opensop config set url <URL>` or use `opensop --server <url> list`. |
 | `not inside an OpenSOP cell` on `opensop scope` | cwd is outside the workspace cell | `cd` into the cell, or run `opensop init` to create one |
 | Network blocked from `raw.githubusercontent.com` | Corporate proxy / hermetic env | Use the from-source fallback in Step 2 |
 
@@ -154,4 +154,4 @@ If a command fails for a reason not covered by the "Common issues" table above, 
 
 ---
 
-**Done?** Tell the user OpenSOP CLI is installed at version 0.6.0 and they can start with `opensop help`.
+**Done?** Tell the user OpenSOP CLI is installed at version 0.8.0 and they can start with `opensop help`.

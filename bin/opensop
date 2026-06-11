@@ -16,7 +16,7 @@ set -euo pipefail
 # Constants & paths
 # --------------------------------------------------------------------------- #
 
-readonly OPENSOP_CLI_VERSION="0.7.0"
+readonly OPENSOP_CLI_VERSION="0.8.0"
 readonly OPENSOP_HOME="${OPENSOP_HOME:-$HOME/.opensop}"
 readonly CONFIG_FILE="$OPENSOP_HOME/config"
 readonly CACHE_FILE="$OPENSOP_HOME/instances.tsv"
@@ -89,7 +89,8 @@ die() { err "$@"; exit 1; }
 
 # Output mode: pretty | json. Set by --json / --pretty flags or auto-detected.
 OUTPUT_MODE="auto"
-LOCAL_MODE=false                                                  # --local: run against internal files (no server)
+LOCAL_MODE=false                                                  # DEPRECATED no-op alias (local is now the default)
+REMOTE_MODE=false                                                 # --remote / --server: route to the configured/given server
 # Local run receipts. v0.6: when inside an OpenSOP cell, the default becomes
 # the active cell's .opensop/ instead of the global ~/.opensop-local — so
 # receipts land alongside the processes that produced them. The explicit
@@ -679,35 +680,42 @@ ${C_BOLD}DISCOVERY${C_RESET}
   list [--tag <tag>]            list all registered processes (optionally filtered by tag)
   search <keyword> [...]        ranked text search over process names, descriptions, tags
   suggest "<task description>"  inverse retrieval — describe a task, get a process recommendation
-  schema <name>                 show the full definition of a process
+  schema <name>                 show the full definition of a process [remote]
 
 ${C_BOLD}INSPECTION${C_RESET}
-  status <id>                   show the current state of an instance
-  steps <id>                    show all steps of an instance
-  diff <id1> <id2>              compare two instances of the same process
-  history --process <name> [--limit N]  recent instances of a specific process (newest-first)
+  status <id>                   show the current state of a run
+  steps <id>                    show all steps of a run
+  diff <id1> <id2>              compare two runs of the same process
+  history --process <name> [--limit N]  recent runs of a specific process (newest-first)
   compass                       top processes by run-count, recency, and failure rate
 
 ${C_BOLD}EXECUTION${C_RESET}
-  run <name> [opts]             start a new instance of a process
+  run <name> [opts]             start a new run of a process
   dry-run <name> [opts]         preview what would happen — validates inputs, no execution
   submit <id> <step-id> [opts]  submit outputs to advance a paused step
-  cancel <id> [--reason TEXT]   cancel a running instance
+  cancel <id> [--reason TEXT]   cancel a running run
 
-${C_BOLD}LOCAL EXECUTION (--local — internal files, no server)${C_RESET}
-  run <name|file.sop.json> --local           run a process locally; bare name resolves across the cell chain (nearest wins)
-  submit <run_id> <step-id> --local [opts]   resume a paused (waiting) run — inject outputs and re-enter execution at cursor
-                                             opts: --output k=v (repeatable), --decided-by <actor>, --confidence <float>
-  list --local [dir] [--conflicts]           list local processes; no arg + inside a cell walks the chain; --conflicts marks shadowed entries
-  runs                                       list local runs
-  show <run_id>                              show a local run's manifest + per-step receipts
+${C_BOLD}LOCAL EXECUTION (default — no server required)${C_RESET}
+  run <name|file.sop.json>           run a process locally; bare name resolves across the cell chain (nearest wins)
+  dry-run <name|file.sop.json>       preview a local process — validates inputs, shows step walkthrough, no run created
+  submit <run_id> <step-id> [opts]   resume a paused (waiting) run — inject outputs and re-enter execution at cursor
+                                     opts: --output k=v (repeatable), --decided-by <actor>, --confidence <float>
+  status <run_id>                    show state of a local run (mirrors remote status shape)
+  steps <run_id>                     list per-step state from a local run's audit log
+  diff <run_id1> <run_id2>           compare two local runs of the same process (inputs/outputs/per-step state)
+  cancel <run_id> [--reason TEXT]    cancel a running or waiting local run; completed/failed/cancelled → rejected
+  list [dir] [--conflicts]           list local processes; no arg + inside a cell walks the chain; --conflicts marks shadowed entries
+  search <kw...>                     ranked text search over cell-chain processes (no server)
+  suggest "<task>" [--threshold N]   intent scoring over cell-chain processes (no server)
+  runs                               list local runs
+  show <run_id>                      show a local run's manifest + per-step receipts
   ${C_DIM}⚠ local steps run as shell on this machine — only run process files you trust${C_RESET}
 
 ${C_BOLD}LOCAL STEP TYPES (v0.7 — full SPEC parity)${C_RESET}
   automated          run a shell script; JSON stdout merged into context
   shell              alias for automated
   noop               no-op placeholder; passes through context unchanged
-  form               pauses run (waiting_for_input); resume via: opensop submit <run_id> <step-id> --local --output k=v
+  form               pauses run (waiting_for_input); resume via: opensop submit <run_id> <step-id> --output k=v
   approval           pauses run (waiting_for_approval); expects decision=approve|reject (or custom outputs/schema)
   wait               wait.seconds → completes immediately with {waited:true}; wait.until → pauses (waiting_for_callback)
   llm                call Anthropic Claude; requires ANTHROPIC_API_KEY; model must start with "claude"
@@ -722,11 +730,11 @@ ${C_BOLD}CELLS (v0.6 — fractal addressing)${C_RESET}
   fork <name> [--from <cell>]       copy an ancestor cell's skill into the active cell + record forked_from snapshot
 
 ${C_BOLD}AUTHORING${C_RESET}
-  register <process.yaml>       POST a .sop.yaml to /sop/processes/register
+  register <process.yaml>       POST a .sop.yaml to /sop/processes/register (requires --remote or --server)
   schema validate <file.yaml>   client-side YAML lint (no server round-trip)
 
 ${C_BOLD}ADMIN${C_RESET}
-  instances [--state X] [--process Y]   list instances (paginated)
+  instances [--state X] [--process Y]   list runs (paginated; --remote for server)
 
 ${C_BOLD}CONFIG${C_RESET}
   config                        show current config
@@ -736,7 +744,9 @@ ${C_BOLD}CONFIG${C_RESET}
 ${C_BOLD}GLOBAL OPTIONS${C_RESET}
   --json                        emit JSON to stdout (default when piped)
   --pretty                      pretty-print (default in TTY)
-  --local                       run against internal files with no server (the local backend; see LOCAL EXECUTION)
+  --remote                      route dual commands to the configured remote server (OPENSOP_URL)
+  --server <url>                set the server URL for this invocation and enable remote mode
+  --local                       deprecated no-op (local is now the default); kept for script compatibility
   --help, -h                    show this help
   --version, -v                 print version
 
@@ -747,26 +757,26 @@ ${C_BOLD}INPUT FORMS (for run/dry-run/submit)${C_RESET}
                                 (use --outputs / --output / --outputs-file for submit)
 
 ${C_BOLD}EXAMPLES${C_RESET}
+  # Local (default — no server):
+  opensop run ./greet.sop.json --input name=Ana          # run locally, no server
+  opensop submit <run_id> collect --output email=a@b.com # resume a paused form step
+  opensop status <run_id>                                # local run state
+  opensop list                                           # list local process files
+  opensop runs                                           # list local runs
+  opensop show <run_id>                                  # local run receipts
+
+  # Remote (opt-in with --remote or --server):
   opensop config set url https://demo.opensop.ai
   opensop config set token demo-public-token-resets-daily
-  opensop list
-  opensop schema lead-qualification
-  opensop run lead-qualification \\
+  opensop --remote list
+  opensop --remote run lead-qualification \\
     --input lead_name="Ana García" \\
     --input lead_email=ana@example.com \\
     --input source=website
-  opensop dry-run lead-qualification --input lead_name=X --input lead_email=x@y.com --input source=website
-  opensop status <instance-id>
-  opensop steps <instance-id>
-  opensop diff <id1> <id2>
-  opensop history --process lead-qualification --limit 5
-  opensop compass
-  opensop schema validate ./my-process.sop.yaml
-  opensop register ./my-process.sop.yaml
-  opensop run ./greet.sop.json --local --input name=Ana          # run locally, no server
-  opensop submit <run_id> collect --local --output email=a@b.com # resume a paused form step
-  opensop runs                                                   # list local runs
-  opensop show <run_id>                                          # local run receipts
+  opensop --remote status <run-id>
+  opensop --remote history --process lead-qualification --limit 5
+  opensop --server https://demo.opensop.ai register ./my-process.sop.yaml
+  opensop schema validate ./my-process.sop.yaml  # always local (no server)
 
 ${C_BOLD}ENVIRONMENT${C_RESET}
   OPENSOP_URL                   override config server URL for one call
@@ -826,8 +836,8 @@ cmd_config() {
 # --------------------------------------------------------------------------- #
 
 cmd_list() {
-  # --local: list internal .sop.json process files instead of server processes.
-  if [[ "$LOCAL_MODE" == true ]]; then local_list "$@"; return $?; fi
+  # Default: list local .sop.json process files. With --remote/--server: list from server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_list "$@"; return $?; fi
   local tag_filter=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -859,6 +869,10 @@ cmd_list() {
 # --------------------------------------------------------------------------- #
 
 cmd_schema() {
+  if [[ "$REMOTE_MODE" != true ]]; then
+    die "schema lookup requires a remote server" "usage_error" \
+        "pass --remote (configured server) or --server <url>"
+  fi
   [[ $# -lt 1 ]] && die "usage: opensop schema <name>" "usage_error" "run opensop help"
   local name="$1"
   api_get "/sop/$name/schema" | emit_pretty_or_json
@@ -941,8 +955,8 @@ build_payload_object() {
 }
 
 cmd_run() {
-  # --local: run against an internal process file (no server).
-  if [[ "$LOCAL_MODE" == true ]]; then local_run "$@"; return $?; fi
+  # Default: run locally against a process file. With --remote/--server: start on server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_run "$@"; return $?; fi
   [[ $# -lt 1 ]] && die "usage: opensop run <name> [--inputs '<json>' | --input KEY=VALUE ...] [--metadata KEY=VALUE ...]" "usage_error" "run opensop help"
   local name="$1"; shift
 
@@ -981,6 +995,8 @@ cmd_run() {
 # --------------------------------------------------------------------------- #
 
 cmd_status() {
+  # Default: read from local run directory. With --remote/--server: query server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_status "$@"; return $?; fi
   [[ $# -lt 1 ]] && die "usage: opensop status <instance-id>" "usage_error" "run opensop help"
   local id="$1"
   local name; name=$(lookup_name "$id")
@@ -1005,6 +1021,7 @@ cmd_status() {
           completed) glyph="${C_GREEN}✓${C_RESET}" ;;
           failed)    glyph="${C_RED}✗${C_RESET}" ;;
           active)    glyph="${C_YELLOW}⏳${C_RESET}" ;;
+          waiting)   glyph="${C_YELLOW}⏳${C_RESET}" ;;  # local-equivalent of remote 'active' for paused steps
           skipped)   glyph="${C_DIM}—${C_RESET}" ;;
           *)         glyph="${C_DIM}·${C_RESET}" ;;
         esac
@@ -1016,6 +1033,8 @@ cmd_status() {
 }
 
 cmd_steps() {
+  # Default: derive steps from local run's audit.jsonl. With --remote/--server: query server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_steps "$@"; return $?; fi
   [[ $# -lt 1 ]] && die "usage: opensop steps <instance-id>" "usage_error" "run opensop help"
   local id="$1"
   local name; name=$(lookup_name "$id")
@@ -1023,6 +1042,8 @@ cmd_steps() {
 }
 
 cmd_cancel() {
+  # Default: cancel a local run. With --remote/--server: cancel on server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_cancel "$@"; return $?; fi
   [[ $# -lt 1 ]] && die "usage: opensop cancel <instance-id> [--reason TEXT]" "usage_error" "run opensop help"
   local id="$1"; shift
   local reason=""
@@ -1050,8 +1071,8 @@ cmd_cancel() {
 # --------------------------------------------------------------------------- #
 
 cmd_submit() {
-  # --local: resume a paused local run (no server).
-  if [[ "$LOCAL_MODE" == true ]]; then local_submit "$@"; return $?; fi
+  # Default: resume a paused local run. With --remote/--server: submit to server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_submit "$@"; return $?; fi
   [[ $# -lt 2 ]] && die "usage: opensop submit <instance-id> <step-id> [--outputs '<json>' | --output KEY=VALUE ...] [--decided-by WHO] [--confidence N]" "usage_error" "run opensop help"
   local id="$1" step_id="$2"; shift 2
 
@@ -1076,7 +1097,7 @@ cmd_submit() {
     local instance_state step_state
     instance_state=$(echo "$resp" | jq -r '.instance.state')
     step_state=$(echo "$resp" | jq -r '.step.state')
-    ok "submitted $step_id ($step_state) — instance $instance_state"
+    ok "submitted $step_id ($step_state) — run $instance_state"
     info "next:  opensop status $id"
   else
     echo "$resp" | emit_pretty_or_json
@@ -1088,6 +1109,8 @@ cmd_submit() {
 # --------------------------------------------------------------------------- #
 
 cmd_instances() {
+  # Default: enumerate local runs. With --remote/--server: query server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_instances "$@"; return $?; fi
   local query=""
   local state="" process="" limit=50 offset=0
   while [[ $# -gt 0 ]]; do
@@ -1114,7 +1137,7 @@ cmd_instances() {
   if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
     local total
     total=$(echo "$resp" | jq -r '.total')
-    info "$total instance(s)"
+    info "$total run(s)"
     echo "$resp" | jq -r '.instances[]? | "\(.id)\t\(.process.name)\t\(.state)\t\(.started_at // "")"' | \
       while IFS=$'\t' read -r id name pstate started; do
         local color="$C_BLUE"
@@ -1179,6 +1202,8 @@ score_processes() {
 }
 
 cmd_search() {
+  # Default: search over local process files in the cell chain. With --remote/--server: search server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_search "$@"; return $?; fi
   [[ $# -lt 1 ]] && die "usage: opensop search <keyword> [keyword2 ...]" "usage_error" "run opensop help"
   local -a keywords=("$@")
   local keywords_json
@@ -1215,6 +1240,8 @@ cmd_search() {
 }
 
 cmd_suggest() {
+  # Default: suggest from local process files in the cell chain. With --remote/--server: suggest from server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_suggest "$@"; return $?; fi
   [[ $# -lt 1 ]] && die "usage: opensop suggest \"<task description>\"" "usage_error" "run opensop help"
   # Treat all positional args as one concatenated task string.
   local task="$*"
@@ -1302,6 +1329,8 @@ cmd_suggest() {
 # --------------------------------------------------------------------------- #
 
 cmd_diff() {
+  # Default: compare two local runs. With --remote/--server: compare server instances.
+  if [[ "$REMOTE_MODE" != true ]]; then local_diff "$@"; return $?; fi
   [[ $# -lt 2 ]] && die "usage: opensop diff <id1> <id2>" "usage_error" "run opensop help"
   local id1="$1" id2="$2"
 
@@ -1351,7 +1380,7 @@ cmd_diff() {
   if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
     local identical; identical=$(echo "$diff_json" | jq -r '.identical')
     if [[ "$identical" == "true" ]]; then
-      ok "instances are identical"
+      ok "runs are identical"
       return 0
     fi
     printf '%sdiff%s  %s  vs  %s\n\n' "$C_BOLD" "$C_RESET" "$id1" "$id2"
@@ -1371,6 +1400,8 @@ cmd_diff() {
 # --------------------------------------------------------------------------- #
 
 cmd_compass() {
+  # Default: compute compass metrics over local runs. With --remote/--server: query server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_compass "$@"; return $?; fi
   # Paginate up to 1000 instances in batches of 200.
   local all_instances="[]"
   local offset=0 batch_size=200 fetched=0
@@ -1434,6 +1465,8 @@ cmd_compass() {
 # --------------------------------------------------------------------------- #
 
 cmd_history() {
+  # Default: enumerate local runs for one process. With --remote/--server: query server.
+  if [[ "$REMOTE_MODE" != true ]]; then local_history "$@"; return $?; fi
   local process="" limit=10
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1491,6 +1524,8 @@ walk_steps_preview() {
 }
 
 cmd_dry_run() {
+  # Default: preview a local process file. With --remote/--server: validate against server schema.
+  if [[ "$REMOTE_MODE" != true ]]; then local_dry_run "$@"; return $?; fi
   [[ $# -lt 1 ]] && die "usage: opensop dry-run <name> [--inputs '<json>' | --input KEY=VALUE ...] [--inputs-file <path>]" "usage_error" "run opensop help"
   local name="$1"; shift
 
@@ -1600,6 +1635,11 @@ cmd_dry_run() {
 # --------------------------------------------------------------------------- #
 
 cmd_register() {
+  # register is remote-only: requires --remote (configured server) or --server <url>.
+  if [[ "$REMOTE_MODE" != true ]]; then
+    die "register requires a remote server" "usage_error" \
+        "pass --remote (configured server) or --server <url>"
+  fi
   [[ $# -lt 1 ]] && die "usage: opensop register <process.yaml>" "usage_error" "run opensop help"
   local file="$1"
   [[ ! -f "$file" ]] && die "file does not exist: $file" "file_not_found"
@@ -1830,7 +1870,7 @@ _local_finalize_trap() {
 
 # opensop run <process.sop.json> --local [--input k=v ...]
 local_run() {
-  [[ $# -lt 1 ]] && die "usage: opensop run <name|process.sop.json> --local [--input KEY=VALUE ...]" "usage_error" "run opensop help"
+  [[ $# -lt 1 ]] && die "usage: opensop run <name|process.sop.json> [--input KEY=VALUE ...]" "usage_error" "run opensop help"
   local proc_arg="$1"; shift
 
   # v0.6: argument resolution.
@@ -1951,7 +1991,7 @@ local_run() {
       ok "ran $C_BOLD$name$C_RESET locally — waiting at $wait_step"
       info "  run: $run_id"
       info "  dir: $run_dir"
-      info "next:  opensop submit $run_id $wait_step --local --output k=v"
+      info "next:  opensop submit $run_id $wait_step --output k=v"
     else
       jq -c . "$run_dir/manifest.json"
     fi
@@ -2627,7 +2667,7 @@ $llm_rendered_prompt"
               # → { waiting: "waiting_for_callback" }.
               # NOTE: there is no inbound HTTP receiver in the local backend — the
               # third party cannot post back to us. The operator resumes manually via
-              # `opensop submit <run_id> <step-id> --local`.
+              # `opensop submit <run_id> <step-id>`.
               local WH_FIRE_CODE="" WH_FIRE_BODY=""
               _wh_fire_http
               if [[ "$wh_ok" == true ]]; then
@@ -2884,7 +2924,7 @@ $llm_rendered_prompt"
 #
 # Contract: never re-runs steps at index < cursor.next_index (idempotency).
 local_submit() {
-  [[ $# -lt 2 ]] && die "usage: opensop submit <run_id> <step-id> --local [--output KEY=VALUE ...] [--outputs '<json>'] [--decided-by WHO]" "usage_error" "run opensop help"
+  [[ $# -lt 2 ]] && die "usage: opensop submit <run_id> <step-id> [--output KEY=VALUE ...] [--outputs '<json>'] [--decided-by WHO]" "usage_error" "run opensop help"
   local run_id="$1" step_id="$2"; shift 2
 
   local run_dir="$OPENSOP_LOCAL_HOME/runs/$run_id"
@@ -2904,6 +2944,7 @@ local_submit() {
   local built; built="$(build_payload_object output "$@")"
   local submitted; submitted="$(jq -c '.payload' <<<"$built")"
   local decided_by; decided_by="$(jq -r '.decided_by' <<<"$built")"
+  local confidence; confidence="$(jq -r '.confidence' <<<"$built")"
 
   # Validate submitted outputs against manifest.waiting.expects.schema.
   # Reuse the same required/enum/type logic as the dry-run validator.
@@ -2990,9 +3031,11 @@ local_submit() {
     --arg a "$submitted_at" --arg b "$submitted_at" \
     --argjson out "$out_json" \
     --arg db "$decided_by" \
+    --arg conf "$confidence" \
     '{run_id:$rid, step:$sid, type:$t, executor:$ex, status:"completed",
       exit_code:0, started_at:$a, ended_at:$b, output:$out}
-     + (if $db != "" then {decided_by:$db} else {} end)' >> "$audit"
+     + (if $db   != "" then {decided_by:$db} else {} end)
+     + (if $conf != "" then {confidence:($conf | tonumber)} else {} end)' >> "$audit"
 
   # Update context.json checkpoint with the submitted data (atomic write).
   printf '%s' "$ctx" > "$run_dir/context.json.tmp" && mv "$run_dir/context.json.tmp" "$run_dir/context.json"
@@ -3059,7 +3102,7 @@ local_submit() {
     trap - EXIT
     if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
       ok "submitted $step_id — run $run_id now waiting at $wait_step2"
-      info "next:  opensop submit $run_id $wait_step2 --local --output k=v"
+      info "next:  opensop submit $run_id $wait_step2 --output k=v"
     else
       jq -c . "$mf"
     fi
@@ -3086,6 +3129,341 @@ local_submit() {
   [ "$run_status" = completed ]
 }
 
+# _enumerate_local_processes
+#   Walk the active cell + ancestors (nearest first), glob processes/*.sop.json,
+#   and emit one JSON record per process suitable for score_processes.
+#   Nearest-cell-wins dedup: if two cells have a process with the same logical
+#   name (basename without .sop.json), only the nearest one's record is emitted
+#   (identical precedence rule as local_list --conflicts).
+#
+#   Record shape (matches what score_processes expects under .processes[]):
+#     { name, description, tags, inputs_summary, outputs_summary }
+#   corpus fields are extracted from the .sop.json; non-string scalars are
+#   coerced to strings so jq's ascii_downcase doesn't choke on them.
+#
+#   Output: a single JSON object { processes: [...] } on stdout.
+#
+#   bash 3.2 compat: dedup tracked via a space-padded string of basenames
+#   (no associative arrays).
+_enumerate_local_processes() {
+  local cell; cell="$(_find_scope_root)"
+
+  # Build the list of cells to walk (active + ancestors).
+  local -a cell_dirs=()
+  if [[ -n "$cell" ]]; then
+    cell_dirs+=("$cell")
+    while IFS= read -r anc; do
+      [[ -n "$anc" ]] && cell_dirs+=("$anc")
+    done < <(_enumerate_ancestors "$cell")
+  fi
+
+  local _seen_names=" "
+  local records_json="[]"
+
+  local d
+  for d in "${cell_dirs[@]+"${cell_dirs[@]}"}"; do
+    [[ -d "$d/processes" ]] || continue
+    while IFS= read -r f; do
+      [[ -f "$f" ]] || continue
+      local bn; bn="$(basename "$f" .sop.json)"
+      # Dedup: if this basename was already seen in a nearer cell, skip it.
+      case "$_seen_names" in
+        *" $bn "*)  continue ;;
+      esac
+      _seen_names="$_seen_names$bn "
+
+      # Extract searchable fields from the .sop.json.
+      # inputs_summary: comma-joined list of input field names.
+      # outputs_summary: comma-joined list of output field names across all steps.
+      # Handles both flat process (inputs: {}) and wrapped envelope.
+      local rec
+      rec="$(jq -c '
+        # Resolve process root — may be wrapped under "process" key or flat.
+        (if has("process") then .process else . end) as $p |
+        # name
+        ($p.name // "") as $name |
+        # description
+        ($p.description // "") as $desc |
+        # tags
+        ($p.tags // []) as $tags |
+        # inputs: declared at process level — support array or object keys.
+        (if ($p.inputs | type) == "array"  then [$p.inputs[]?.name // empty]
+         elif ($p.inputs | type) == "object" then [$p.inputs | keys[]]
+         else []
+         end | join(", ")) as $inp_sum |
+        # outputs: declared across steps (steps[].outputs[].name).
+        ([$p.steps[]?.outputs[]?.name // empty] | unique | join(", ")) as $out_sum |
+        {name: $name, description: $desc, tags: $tags,
+         inputs_summary: $inp_sum, outputs_summary: $out_sum}
+      ' "$f" 2>/dev/null)" || continue
+      [[ -z "$rec" ]] && continue
+      records_json="$(jq -c --argjson r "$rec" '. + [$r]' <<<"$records_json")"
+    done < <(find "$d/processes" -maxdepth 1 -name '*.sop.json' 2>/dev/null)
+  done
+
+  jq -nc --argjson procs "$records_json" '{processes: $procs}'
+}
+
+# local_search <keyword> [keyword2 ...]
+#   Ranked text search over the cell-chain process corpus (no server).
+#   Mirrors cmd_search output shape exactly.
+local_search() {
+  [[ $# -lt 1 ]] && die "usage: opensop search <keyword> [keyword2 ...]" "usage_error" "run opensop help"
+  local -a keywords=("$@")
+  local keywords_json
+  keywords_json=$(printf '%s\n' "${keywords[@]}" | jq -Rsc '[split("\n")[] | select(length > 0)]')
+
+  local resp; resp="$(_enumerate_local_processes)"
+  local results; results=$(score_processes "$keywords_json" "$resp")
+
+  # Top 5 only — same cap as remote.
+  local top5; top5=$(echo "$results" | jq -c '.[0:5]')
+
+  local count; count=$(echo "$top5" | jq 'length')
+  if [[ "$count" -eq 0 ]]; then
+    printf 'no matches for: %s\n' "${keywords[*]}" >&2
+    exit 0
+  fi
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    echo "$top5" | jq -r '.[] | "\(.score)\t\(.name)\t\(.tags | join(", "))\t\(.description)"' | \
+      while IFS=$'\t' read -r score name tags desc; do
+        local snippet="${desc:0:60}"
+        [[ "${#desc}" -gt 60 ]] && snippet="${snippet}…"
+        printf '%s%-4s%s  %s%-30s%s %s%s%s  %s\n' \
+          "$C_DIM" "$score" "$C_RESET" \
+          "$C_BOLD" "$name" "$C_RESET" \
+          "$C_DIM" "(${tags})" "$C_RESET" \
+          "$snippet"
+      done
+  else
+    local query_arr; query_arr=$(printf '%s\n' "${keywords[@]}" | jq -Rsc '[split("\n")[] | select(length > 0)]')
+    echo "$top5" | jq -c --argjson q "$query_arr" '{query: $q, results: .}'
+  fi
+}
+
+# local_suggest "<task>" [--threshold N]
+#   Intent scoring over the cell-chain process corpus (no server).
+#   Mirrors cmd_suggest output shape exactly.
+local_suggest() {
+  [[ $# -lt 1 ]] && die "usage: opensop suggest \"<task description>\"" "usage_error" "run opensop help"
+  local task="$*"
+  local -a keywords
+  IFS=' ' read -r -a keywords <<< "$task"
+
+  local threshold="0.0"
+  local -a remaining_args=("$@")
+  local -a parsed_keywords=()
+  local i=0
+  while [[ $i -lt ${#remaining_args[@]} ]]; do
+    local a="${remaining_args[$i]}"
+    if [[ "$a" == "--threshold" ]]; then
+      (( i++ ))
+      threshold="${remaining_args[$i]:-0.0}"
+    else
+      parsed_keywords+=("$a")
+    fi
+    (( i++ ))
+  done
+
+  if (( ${#parsed_keywords[@]} > 0 )); then
+    task="${parsed_keywords[*]}"
+    IFS=' ' read -r -a keywords <<< "$task"
+  fi
+
+  [[ ${#keywords[@]} -eq 0 ]] && die "usage: opensop suggest \"<task description>\"" "usage_error" "run opensop help"
+
+  local keywords_json
+  keywords_json=$(printf '%s\n' "${keywords[@]}" | jq -Rsc '[split("\n")[] | select(length > 0)]')
+  local num_kws="${#keywords[@]}"
+
+  local resp; resp="$(_enumerate_local_processes)"
+  local results; results=$(score_processes "$keywords_json" "$resp")
+
+  # Top-1 with confidence — identical formula as remote cmd_suggest.
+  local top1; top1=$(echo "$results" | jq -c --argjson nk "$num_kws" '
+    if length == 0 then null
+    else
+      .[0] |
+      . + {confidence: ([1.0, (.score / ([$nk, 1] | max))] | min)}
+    end
+  ')
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    if [[ "$top1" == "null" ]]; then
+      printf 'no clear match for "%s"\n' "$task"
+    else
+      local name confidence desc
+      name=$(echo "$top1" | jq -r '.name')
+      confidence=$(echo "$top1" | jq -r '.confidence | (. * 100 | round / 100 | tostring)')
+      desc=$(echo "$top1" | jq -r '.description')
+      local passes; passes=$(echo "$top1" | jq -r --arg t "$threshold" '(.confidence >= ($t | tonumber)) | tostring')
+      if [[ "$passes" == "true" ]]; then
+        printf '%s→%s this looks like %s%s%s (confidence: %s)\n' \
+          "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET" "$confidence"
+        printf '  %s\n' "$desc"
+      else
+        printf 'no clear match for "%s"\n' "$task"
+      fi
+    fi
+  else
+    local match_json
+    if [[ "$top1" == "null" ]]; then
+      match_json="null"
+    else
+      local passes; passes=$(echo "$top1" | jq -r --arg t "$threshold" '(.confidence >= ($t | tonumber)) | tostring')
+      if [[ "$passes" == "true" ]]; then
+        match_json=$(echo "$top1" | jq -c '{name, confidence, description}')
+      else
+        match_json="null"
+      fi
+    fi
+    jq -nc --arg task "$task" --argjson match "$match_json" '{task: $task, match: $match}'
+  fi
+}
+
+# local_dry_run <name|file.sop.json> [--input K=V ...] [--inputs '<json>'] [--inputs-file <path>]
+#
+# Preview a local process: resolves the process file (explicit path or name
+# via cell chain), validates provided --input/--inputs against the process's
+# declared inputs (same required/type/enum/format checks as cmd_dry_run), and
+# prints the step walkthrough via walk_steps_preview. No run is created.
+#
+# Output mirrors cmd_dry_run exactly:
+#   pretty mode: prose header, validation status, step list
+#   JSON  mode : {process, valid, validation_errors, steps}   ← identical shape
+# Exits 1 when validation fails (same as remote).
+local_dry_run() {
+  [[ $# -lt 1 ]] && die "usage: opensop dry-run <name|file.sop.json> [--input KEY=VALUE ...] [--inputs '<json>'] [--inputs-file <path>]" "usage_error" "run opensop help"
+  local proc_arg="$1"; shift
+
+  # Resolve process file — same logic as local_run.
+  local proc_file=""
+  if [[ "$proc_arg" == *.sop.json ]] || [[ "$proc_arg" == */* ]]; then
+    proc_file="$proc_arg"
+  else
+    proc_file="$(_find_skill_in_cells "$proc_arg")"
+    [[ -z "$proc_file" ]] && die "skill not found: '$proc_arg' (looked in active cell + ancestors)" "file_not_found" \
+        "create processes/${proc_arg}.sop.json in a cell, or pass an explicit path"
+  fi
+  [[ -f "$proc_file" ]] || die "process file not found: $proc_file" "file_not_found"
+  jq -e . "$proc_file" >/dev/null 2>&1 || die "process file is not valid JSON: $proc_file" "invalid_json"
+
+  local name; name="$(jq -r '.name // "unnamed"' "$proc_file")"
+
+  # Parse input flags — same flag set as cmd_dry_run.
+  local json_blob="" file_path=""
+  local -a kv_pairs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --inputs)       json_blob="$2";  shift 2 ;;
+      --inputs-file)  file_path="$2";  shift 2 ;;
+      --input)        kv_pairs+=("$2"); shift 2 ;;
+      *) die "unknown flag for dry-run: $1" "unknown_flag" "run opensop dry-run --help" ;;
+    esac
+  done
+
+  # Build input object.
+  local inputs="{}"
+  if [[ -n "$json_blob" ]]; then
+    inputs=$(echo "$json_blob" | jq .) || die "invalid JSON in --inputs" "invalid_json"
+  elif [[ -n "$file_path" ]]; then
+    inputs=$(jq . "$file_path") || die "could not read $file_path as JSON" "invalid_json"
+  fi
+  if (( ${#kv_pairs[@]} > 0 )); then
+    for kv in "${kv_pairs[@]}"; do
+      [[ "$kv" != *=* ]] && die "--input expects KEY=VALUE, got: $kv" "usage_error"
+      local k="${kv%%=*}" v="${kv#*=}"
+      if echo "$v" | jq -e . >/dev/null 2>&1; then
+        inputs=$(echo "$inputs" | jq --arg k "$k" --argjson v "$v" '.[$k] = $v')
+      else
+        inputs=$(echo "$inputs" | jq --arg k "$k" --arg v "$v" '.[$k] = $v')
+      fi
+    done
+  fi
+
+  # Build a schema-shaped JSON object that walk_steps_preview and the validator
+  # expect: {process: {name, inputs: [...], steps: [...]}}
+  # The .sop.json may have inputs as an array (new style) or an object (dict-style).
+  # Normalise to an array of {name, type?, required?, ...} for the validator.
+  local schema_json
+  schema_json="$(jq -c '
+    # Resolve process root — may be wrapped under "process" key or flat.
+    (if has("process") then .process else . end) as $p |
+    # Normalise inputs to array form for the validator.
+    (if ($p.inputs | type) == "array" then $p.inputs
+     elif ($p.inputs | type) == "object" then
+       [$p.inputs | to_entries[] | {name: .key} + (
+         if (.value | type) == "object" then .value else {} end)]
+     else []
+     end) as $inputs_arr |
+    {process: ($p + {inputs: $inputs_arr})}
+  ' "$proc_file")"
+
+  # Validate inputs against process.inputs definition — same jq as cmd_dry_run.
+  local errors_json
+  errors_json=$(echo "$schema_json" | jq -c \
+    --argjson supplied "$inputs" '
+    [ .process.inputs[]? |
+      . as $field |
+      ($supplied[$field.name]) as $val |
+      # Required check.
+      (if ($field.required == true) and ($val == null) then
+        {path: ("inputs." + $field.name), message: ("required field missing: " + $field.name)}
+      else null end),
+      # Type check (best-effort).
+      (if $val != null then
+        if   $field.type == "number"  and ($val | type) != "number"  then
+          {path: ("inputs." + $field.name), message: ($field.name + " must be a number")}
+        elif $field.type == "boolean" and ($val | type) != "boolean" then
+          {path: ("inputs." + $field.name), message: ($field.name + " must be a boolean")}
+        elif $field.type == "enum" and ($field.values != null) and ([$field.values[] | . == $val] | any | not) then
+          {path: ("inputs." + $field.name), message: ($field.name + " must be one of: " + ($field.values | join(", ")))}
+        elif $field.type == "string" and $field.format == "email" and ($val | type) == "string" and ($val | test("^[^@]+@[^@]+\\.[^@]+$") | not) then
+          {path: ("inputs." + $field.name), message: ($field.name + " does not look like an email address")}
+        else null end
+      else null end)
+    ] | map(select(. != null))
+  ')
+
+  local valid=true
+  local err_count; err_count=$(echo "$errors_json" | jq 'length')
+  (( err_count > 0 )) && valid=false
+
+  # Walk steps — build per-step JSON array (same shape as cmd_dry_run).
+  local steps_preview; steps_preview=$(walk_steps_preview "$schema_json")
+  local steps_json
+  steps_json=$(echo "$schema_json" | jq -c '
+    [.process.steps[]? | {step_id: .id, type, preview: ("would execute \(.type) step")}]
+  ')
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    printf '%sdry-run:%s %s\n\n' "$C_BOLD" "$C_RESET" "$name"
+
+    printf '%sinputs validation:%s\n' "$C_BOLD" "$C_RESET"
+    if [[ "$valid" == "true" ]]; then
+      ok "inputs valid"
+    else
+      echo "$errors_json" | jq -r '.[] | "  ✗ \(.message)"' | sed "s/^  ✗/$(printf '%s' "${C_RED}✗${C_RESET}")/g"
+      printf '%svalidation failed (%s error(s))%s\n' "$C_RED" "$err_count" "$C_RESET"
+    fi
+
+    printf '\n%sstep preview:%s\n' "$C_BOLD" "$C_RESET"
+    echo "$steps_preview"
+  else
+    local valid_bool; valid_bool=$( [[ "$valid" == "true" ]] && echo 'true' || echo 'false')
+    jq -nc \
+      --arg process "$name" \
+      --argjson valid "$valid_bool" \
+      --argjson validation_errors "$errors_json" \
+      --argjson steps "$steps_json" \
+      '{process: $process, valid: $valid, validation_errors: $validation_errors, steps: $steps}'
+  fi
+
+  [[ "$valid" == "false" ]] && exit 1
+  return 0
+}
+
 # _find_skill_in_cells <name>
 #   Walk the cell chain (active cell + ancestors, nearest first) looking for
 #   processes/<name>.sop.json. Echo first match (nearest wins), empty if none.
@@ -3106,6 +3484,110 @@ _find_skill_in_cells() {
   done < <(_enumerate_ancestors "$cell")
 }
 
+# opensop status <run_id> --local  — mirror remote cmd_status over a local run
+#
+# Reads manifest.json for top-level state + waiting block.
+# Derives per-step state from audit.jsonl (completed/failed/waiting receipts).
+# JSON output shape mirrors the remote GET /sop/:name/:id response so that
+# Phase-2 default-flip is transparent.
+#
+# Remote shape (what cmd_status's pretty path reads from the API response):
+#   .id, .process.name, .state, .started_at, .completed_at,
+#   .steps[].{step_id, type, state, sub_state}
+local_status() {
+  [[ $# -lt 1 ]] && die "usage: opensop status <run_id>" "usage_error" "run opensop runs"
+  local rid="$1"
+  local run_dir="$OPENSOP_LOCAL_HOME/runs/$rid"
+  [ -d "$run_dir" ] || die "no such local run: $rid (see: opensop runs)" "instance_not_found" "opensop runs"
+  local mf="$run_dir/manifest.json"
+  [ -f "$mf" ] || die "run directory found but manifest.json is missing: $run_dir" "cli_error"
+
+  # Build response JSON that mirrors remote cmd_status's API response shape.
+  # audit.jsonl → steps array: each line is one receipt; status → state;
+  # waiting receipts carry .reason → sub_state.
+  local resp
+  resp="$(jq -nc \
+    --argjson m "$(cat "$mf")" \
+    --argjson steps "$(jq -s '[.[] | {step_id: .step, type, state: .status, sub_state: (.reason // null), started_at, ended_at}]' "$run_dir/audit.jsonl" 2>/dev/null || echo '[]')" \
+    '{
+       id:           $m.run_id,
+       process:      {name: $m.process},
+       state:        $m.status,
+       started_at:   $m.started_at,
+       completed_at: ($m.ended_at // null),
+       waiting:      ($m.waiting  // null),
+       steps:        $steps
+     }')"
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local state ended
+    state=$(echo "$resp" | jq -r '.state')
+    ended=$(echo "$resp" | jq -r '.completed_at // ""')
+    local color="$C_BLUE"
+    [[ "$state" == "completed" ]] && color="$C_GREEN"
+    [[ "$state" == "failed"    ]] && color="$C_RED"
+    [[ "$state" == "cancelled" ]] && color="$C_YELLOW"
+    printf '%sinstance:%s %s\n' "$C_BOLD" "$C_RESET" "$rid"
+    printf '%sprocess:%s  %s\n' "$C_BOLD" "$C_RESET" "$(echo "$resp" | jq -r '.process.name')"
+    printf '%sstate:%s    %s%s%s%s\n' "$C_BOLD" "$C_RESET" "$color" "$state" "$C_RESET" "${ended:+ ($ended)}"
+    echo
+    echo "$resp" | jq -r '.steps[]? | "\(.step_id)\t\(.type)\t\(.state)\t\(.sub_state // "")"' | \
+      while IFS=$'\t' read -r step_id stype sstate sub; do
+        local glyph
+        case "$sstate" in
+          completed) glyph="${C_GREEN}✓${C_RESET}" ;;
+          failed)    glyph="${C_RED}✗${C_RESET}" ;;
+          waiting)   glyph="${C_YELLOW}⏳${C_RESET}" ;;
+          active)    glyph="${C_YELLOW}⏳${C_RESET}" ;;  # remote-equivalent state name (parity with cmd_status)
+          skipped)   glyph="${C_DIM}—${C_RESET}" ;;
+          *)         glyph="${C_DIM}·${C_RESET}" ;;
+        esac
+        printf '  %s %-30s %s%s%s%s\n' "$glyph" "$step_id" "$C_DIM" "$stype" "${sub:+ · $sub}" "$C_RESET"
+      done
+  else
+    echo "$resp" | emit_pretty_or_json
+  fi
+}
+
+# opensop steps <run_id> --local  — mirror remote cmd_steps over a local run
+#
+# Derives per-step state from audit.jsonl (same source as local_status's steps
+# array) and emits through emit_pretty_or_json — matches remote cmd_steps which
+# calls api_get "/sop/:name/:id/steps" | emit_pretty_or_json.
+#
+# Remote shape (GET /sop/:name/:id/steps):
+#   {steps: [{id, step_id, name, type, state, sub_state, inputs, outputs,
+#             decided_by, confidence, position, started_at, completed_at, error, links}]}
+#
+# Local shape (canonical local envelope — run_id is a local-only extra for run lookup):
+#   {run_id, steps: [{step_id, type, state, sub_state, started_at, ended_at,
+#                     decided_by, confidence,           # mirrors remote StepSerializer fields
+#                     exit_code?,   # local-only extra (shell step metadata not in remote)
+#                     output?}]}    # local-only extra (raw step stdout/json; remote uses outputs:{})
+local_steps() {
+  [[ $# -lt 1 ]] && die "usage: opensop steps <run_id>" "usage_error" "run opensop runs"
+  local rid="$1"
+  local run_dir="$OPENSOP_LOCAL_HOME/runs/$rid"
+  [ -d "$run_dir" ] || die "no such local run: $rid (see: opensop runs)" "instance_not_found" "opensop runs"
+  [ -f "$run_dir/manifest.json" ] || die "run directory found but manifest.json is missing: $run_dir" "cli_error"
+
+  jq -nc \
+    --arg rid "$rid" \
+    --argjson steps "$(jq -s '[.[] | {
+        step_id:    .step,
+        type,
+        state:      .status,
+        sub_state:  (.reason // null),
+        started_at,
+        ended_at:   (.ended_at // null),
+        decided_by: (.decided_by // null),   # mirrors remote StepSerializer.decided_by
+        confidence: (.confidence // null),   # mirrors remote StepSerializer.confidence
+        exit_code:  (.exit_code // null),    # local-only extra (shell exit status)
+        output:     (.output // null)        # local-only extra (raw stdout/merged json)
+      }]' "$run_dir/audit.jsonl" 2>/dev/null || echo '[]')" \
+    '{run_id: $rid, steps: $steps}' | emit_pretty_or_json
+}
+
 # opensop list --local [dir]  — discover internal .sop.json processes
 #
 # v0.6: when called with no arg AND cwd is inside a cell, enumerate skills
@@ -3121,7 +3603,7 @@ local_list() {
       --*) die "unknown flag for list: $1" "unknown_flag" "run opensop help" ;;
       *)
         if [[ -z "$dir" ]]; then dir="$1"; shift
-        else die "unexpected arg: $1" "usage_error" "usage: opensop list --local [dir] [--conflicts]"
+        else die "unexpected arg: $1" "usage_error" "usage: opensop list [dir] [--conflicts]"
         fi
         ;;
     esac
@@ -3178,9 +3660,365 @@ local_list() {
   done
 }
 
+# local_instances [--state X] [--process Y] [--limit N] [--offset N]
+#
+# Enumerate $OPENSOP_LOCAL_HOME/runs/*/manifest.json, apply optional filters and
+# pagination, and emit a shape mirroring remote cmd_instances:
+#   pretty : header + one row per instance (id / process / state / started_at)
+#   JSON   : {instances:[...], total:N}          (total = unfiltered post-filter count)
+#
+# Each instance entry mirrors the remote shape:
+#   {id, process:{name}, state, started_at}
+#
+# Deduplication is not needed here — each run_id is unique. Pagination:
+#   offset rows skipped, limit rows emitted (default 50/0 — same as cmd_instances).
+local_instances() {
+  local state="" process="" limit=50 offset=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state)   state="$2";   shift 2 ;;
+      --process) process="$2"; shift 2 ;;
+      --limit)   limit="$2";   shift 2 ;;
+      --offset)  offset="$2";  shift 2 ;;
+      *) die "unknown flag for instances: $1" "unknown_flag" "run opensop instances --help" ;;
+    esac
+  done
+
+  # Collect all manifests, build a JSON array, filter, paginate — all inside jq.
+  # Building an array of compact JSON is bash-3.2 safe (no mapfile/assoc arrays).
+  local raw_json="[]"
+  if [[ -d "$OPENSOP_LOCAL_HOME/runs" ]]; then
+    local d
+    for d in "$OPENSOP_LOCAL_HOME"/runs/*/; do
+      [[ -f "$d/manifest.json" ]] || continue
+      local rec
+      rec="$(jq -c '{id:.run_id, process:{name:.process}, state:.status, started_at:.started_at}' \
+             "$d/manifest.json" 2>/dev/null)" || continue
+      [[ -z "$rec" ]] && continue
+      raw_json="$(jq -c --argjson r "$rec" '. + [$r]' <<<"$raw_json")"
+    done
+  fi
+
+  # Sort newest-first (lexicographic desc on started_at — ISO-8601 sorts correctly),
+  # then filter and paginate entirely in jq.
+  local resp
+  resp="$(jq -nc \
+    --argjson rows "$raw_json" \
+    --arg state    "$state" \
+    --arg process  "$process" \
+    --argjson limit  "$limit" \
+    --argjson offset "$offset" '
+    ($rows | sort_by(.started_at) | reverse) as $sorted |
+    ($sorted
+      | if $state   != "" then map(select(.state           == $state))   else . end
+      | if $process != "" then map(select(.process.name    == $process)) else . end
+    ) as $filtered |
+    {
+      instances: ($filtered[$offset:($offset+$limit)]),
+      total:     ($filtered | length)
+    }
+  ')"
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local total
+    total=$(echo "$resp" | jq -r '.total')
+    info "$total run(s)"
+    echo "$resp" | jq -r '.instances[]? | "\(.id)\t\(.process.name)\t\(.state)\t\(.started_at // "")"' | \
+      while IFS=$'\t' read -r id name pstate started; do
+        local color="$C_BLUE"
+        [[ "$pstate" == "completed" ]] && color="$C_GREEN"
+        [[ "$pstate" == "failed"    ]] && color="$C_RED"
+        [[ "$pstate" == "cancelled" ]] && color="$C_YELLOW"
+        [[ "$pstate" == "waiting"   ]] && color="$C_YELLOW"
+        printf '  %s  %-25s %s%-10s%s %s\n' "$id" "$name" "$color" "$pstate" "$C_RESET" "$C_DIM$started$C_RESET"
+      done
+  else
+    echo "$resp" | emit_pretty_or_json
+  fi
+}
+
+# local_compass
+#
+# Produce {by_runs, by_recency, by_failure_rate} over $OPENSOP_LOCAL_HOME/runs/*/
+# mirroring cmd_compass's documented output shape exactly. Reads every manifest.json
+# and computes the three rankings with the same jq formula as the remote path.
+local_compass() {
+  local raw_json="[]"
+  if [[ -d "$OPENSOP_LOCAL_HOME/runs" ]]; then
+    local d
+    for d in "$OPENSOP_LOCAL_HOME"/runs/*/; do
+      [[ -f "$d/manifest.json" ]] || continue
+      local rec
+      # Shape mirrors what cmd_compass receives from api_get /sop/instances:
+      #   {process:{name}, state, started_at}
+      rec="$(jq -c '{process:{name:.process}, state:.status, started_at:.started_at}' \
+             "$d/manifest.json" 2>/dev/null)" || continue
+      [[ -z "$rec" ]] && continue
+      raw_json="$(jq -c --argjson r "$rec" '. + [$r]' <<<"$raw_json")"
+    done
+  fi
+
+  # Exact same jq logic as cmd_compass (copy, not diverge).
+  local stats
+  stats=$(echo "$raw_json" | jq -c '
+    group_by(.process.name) |
+    map(
+      . as $grp |
+      ($grp | map(select(.state == "failed" or .state == "cancelled")) | length) as $failures |
+      ($grp | length) as $total |
+      {
+        name:         $grp[0].process.name,
+        total:        $total,
+        last_run_at:  ($grp | map(.started_at) | sort | last),
+        failures:     $failures,
+        rate:         ($failures / $total)
+      }
+    ) | {
+      by_runs:         (sort_by(-.total)        | .[0:10] | map({name, total})),
+      by_recency:      (sort_by(.last_run_at) | reverse | .[0:10] | map({name, last_run_at})),
+      by_failure_rate: (sort_by(-.rate)         | .[0:10] | map({name, total, failures, rate}))
+    }
+  ')
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local by_runs by_recency by_failure
+    by_runs=$(   echo "$stats" | jq -c '.by_runs')
+    by_recency=$(echo "$stats" | jq -c '.by_recency')
+    by_failure=$(echo "$stats" | jq -c '.by_failure_rate')
+
+    printf '%sMost-run:%s\n' "$C_BOLD" "$C_RESET"
+    echo "$by_runs" | jq -r '.[] | "  \(.name) × \(.total)"'
+
+    printf '\n%sMost-recent:%s\n' "$C_BOLD" "$C_RESET"
+    echo "$by_recency" | jq -r '.[] | "  \(.name)  \(.last_run_at // "-")"'
+
+    printf '\n%sHighest failure rate:%s\n' "$C_BOLD" "$C_RESET"
+    echo "$by_failure" | jq -r '.[] | "  \(.name)  \(.rate * 100 | round | tostring)%  (\(.failures)/\(.total))"'
+  else
+    echo "$stats" | emit_pretty_or_json
+  fi
+}
+
+# local_history --process <name> [--limit N]
+#
+# Show instances filtered to one process (newest-first). Delegates to
+# local_instances, mirroring how cmd_history delegates to cmd_instances.
+local_history() {
+  local process="" limit=10
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --process) process="$2"; shift 2 ;;
+      --limit)   limit="$2";   shift 2 ;;
+      *) die "unknown flag for history: $1" "unknown_flag" "run opensop history --help" ;;
+    esac
+  done
+  [[ -z "$process" ]] && die "usage: opensop history --process <name> [--limit N]" "usage_error" "run opensop help"
+  local_instances --process "$process" --limit "$limit"
+}
+
+# local_diff <run_id1> <run_id2>
+#
+# Compare two local runs and emit a diff in the same shape as remote cmd_diff:
+#
+#   JSON:   {a:{id,state,started_at}, b:{id,state,started_at},
+#            differences:[{path,a,b}], identical:true|false}
+#   pretty: table of differing paths with a/b values (same rendering as cmd_diff)
+#
+# What is compared (mirrors the remote fields cmd_diff inspects):
+#   top-level : state   (manifest.status ↔ remote .state)
+#               outputs (final context.json ↔ remote .outputs)    — local equivalent of remote outputs
+#               metadata (manifest.metadata ↔ remote .metadata)
+#   per-step  : state      (receipt.status ↔ remote step.state)
+#               sub_state  (receipt.reason ↔ remote step.sub_state)
+#               outputs    (receipt.output ↔ remote step.outputs)
+#               decided_by (receipt.decided_by ↔ remote step.decided_by)
+#               confidence (receipt.confidence ↔ remote step.confidence)  — matches remote StepSerializer
+#               duration_ms (receipt.duration_ms ↔ remote step.duration_ms)
+#               exit_code  (receipt.exit_code) — local-only extra (shell exit status; no remote equivalent)
+#
+# NOT compared: inputs — remote cmd_diff does not diff inputs; omitted for parity.
+#
+# Error paths: unknown run_id → die instance_not_found; same process guard (mirrors remote).
+local_diff() {
+  [[ $# -lt 2 ]] && die "usage: opensop diff <run_id1> <run_id2>" "usage_error" "run opensop help"
+  local rid1="$1" rid2="$2"
+
+  local dir1="$OPENSOP_LOCAL_HOME/runs/$rid1"
+  local dir2="$OPENSOP_LOCAL_HOME/runs/$rid2"
+  [ -d "$dir1" ] || die "no such local run: $rid1 (see: opensop runs)" "instance_not_found" "opensop runs"
+  [ -d "$dir2" ] || die "no such local run: $rid2 (see: opensop runs)" "instance_not_found" "opensop runs"
+  [ -f "$dir1/manifest.json" ] || die "run directory found but manifest.json is missing: $dir1" "cli_error"
+  [ -f "$dir2/manifest.json" ] || die "run directory found but manifest.json is missing: $dir2" "cli_error"
+
+  local mf1; mf1="$(cat "$dir1/manifest.json")"
+  local mf2; mf2="$(cat "$dir2/manifest.json")"
+
+  # Same-process guard (mirrors remote cmd_diff).
+  local proc1 proc2
+  proc1="$(jq -r '.process // ""' <<<"$mf1")"
+  proc2="$(jq -r '.process // ""' <<<"$mf2")"
+  [[ "$proc1" != "$proc2" ]] && \
+    die "runs are from different processes ($proc1 vs $proc2); diff requires the same process" "cli_error"
+
+  # Read audit receipts for each run (one JSON object per line → array via jq -s).
+  local steps1 steps2
+  steps1="$(jq -s '.' "$dir1/audit.jsonl" 2>/dev/null || echo '[]')"
+  steps2="$(jq -s '.' "$dir2/audit.jsonl" 2>/dev/null || echo '[]')"
+
+  # Read final context for each run.
+  local ctx1 ctx2
+  ctx1="$(cat "$dir1/context.json" 2>/dev/null || echo 'null')"
+  ctx2="$(cat "$dir2/context.json" 2>/dev/null || echo 'null')"
+
+  # Build the diff entirely in jq — mirrors cmd_diff's jq block.
+  local diff_json
+  diff_json="$(jq -nc \
+    --argjson mf1   "$mf1" \
+    --argjson mf2   "$mf2" \
+    --argjson s1    "$steps1" \
+    --argjson s2    "$steps2" \
+    --argjson ctx1  "$ctx1" \
+    --argjson ctx2  "$ctx2" \
+    --arg     id1   "$rid1" \
+    --arg     id2   "$rid2" '
+    def maybe_diff(p; va; vb):
+      if va != vb then [{path: p, a: va, b: vb}] else [] end;
+
+    # Top-level field comparisons — mirrors remote cmd_diff exactly:
+    #   state    (manifest.status   → remote .state)
+    #   outputs  (final context.json → remote .outputs; local equivalent of server-side outputs)
+    #   metadata (manifest.metadata  → remote .metadata)
+    # NOTE: inputs is NOT diffed here — remote cmd_diff does not diff inputs (parity match).
+    (maybe_diff("state";    $mf1.status;    $mf2.status)) +
+    (maybe_diff("outputs";  $ctx1;          $ctx2)) +
+    (maybe_diff("metadata"; ($mf1.metadata // null); ($mf2.metadata // null))) +
+
+    # Per-step diffs — iterate all step IDs seen in either run.
+    ([$s1[]?.step, $s2[]?.step] | unique | map(select(. != null)) |
+      map(. as $sid |
+        # Last receipt per step-id (in case of waiting→completed two-line audit).
+        ($s1 | map(select(.step == $sid)) | last // null) as $ra |
+        ($s2 | map(select(.step == $sid)) | last // null) as $rb |
+        maybe_diff("steps.\($sid).state";      $ra.status;      $rb.status) +
+        maybe_diff("steps.\($sid).sub_state";  $ra.reason;      $rb.reason) +
+        maybe_diff("steps.\($sid).outputs";    $ra.output;      $rb.output) +
+        maybe_diff("steps.\($sid).decided_by"; $ra.decided_by;  $rb.decided_by) +
+        maybe_diff("steps.\($sid).confidence"; $ra.confidence;  $rb.confidence) +  # mirrors remote StepSerializer.confidence
+        maybe_diff("steps.\($sid).duration_ms";$ra.duration_ms; $rb.duration_ms) +
+        maybe_diff("steps.\($sid).exit_code";  $ra.exit_code;   $rb.exit_code)     # local-only extra (shell exit status)
+      ) | add // []) |
+
+    {
+      a:           {id: $id1, state: $mf1.status, started_at: $mf1.started_at},
+      b:           {id: $id2, state: $mf2.status, started_at: $mf2.started_at},
+      differences: .,
+      identical:   (length == 0)
+    }
+  ')"
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    local identical; identical="$(jq -r '.identical' <<<"$diff_json")"
+    if [[ "$identical" == "true" ]]; then
+      ok "runs are identical"
+      return 0
+    fi
+    printf '%sdiff%s  %s  vs  %s\n\n' "$C_BOLD" "$C_RESET" "$rid1" "$rid2"
+    jq -r '.differences[] | "\(.path)\t\(.a // "null")\t\(.b // "null")"' <<<"$diff_json" | \
+      while IFS=$'\t' read -r path va vb; do
+        printf '  %s%-50s%s\n' "$C_BOLD" "$path" "$C_RESET"
+        printf '    %sa:%s %s\n' "$C_RED"   "$C_RESET" "$va"
+        printf '    %sb:%s %s\n' "$C_GREEN" "$C_RESET" "$vb"
+      done
+  else
+    jq -c . <<<"$diff_json" | emit_pretty_or_json
+  fi
+}
+
+# local_cancel <run_id> [--reason TEXT]
+#
+# Cancel a local run that is running or waiting.
+# Mirrors remote cmd_cancel semantics:
+#   - Only running/waiting runs can be cancelled (completed/failed/cancelled → rejected,
+#     same invalid-transition behaviour as the runtime).
+#   - Sets manifest.status = "cancelled", clears the waiting block, writes ended_at.
+#   - Appends a "cancelled" receipt to audit.jsonl (includes reason if given).
+#
+# Output (JSON):  the updated manifest (same shape as local_submit's manifest echo).
+# Output (pretty): ok line + optional reason (mirrors remote cmd_cancel's pretty output).
+local_cancel() {
+  [[ $# -lt 1 ]] && die "usage: opensop cancel <run_id> [--reason TEXT]" "usage_error" "run opensop help"
+  local run_id="$1"; shift
+
+  local reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason) reason="$2"; shift 2 ;;
+      *) die "unknown flag for cancel: $1" "unknown_flag" "run opensop cancel --help" ;;
+    esac
+  done
+
+  local run_dir="$OPENSOP_LOCAL_HOME/runs/$run_id"
+  [ -d "$run_dir" ] || die "no such local run: $run_id (see: opensop runs)" "instance_not_found" "opensop runs"
+  local mf="$run_dir/manifest.json"
+  [ -f "$mf" ] || die "run directory found but manifest.json is missing: $run_dir" "cli_error"
+
+  # Status gate: only running/waiting runs can be cancelled.
+  local mf_status; mf_status="$(jq -r '.status' "$mf")"
+  case "$mf_status" in
+    running|waiting) ;;
+    completed|failed|cancelled)
+      die "run $run_id is '$mf_status' — only running or waiting runs can be cancelled" \
+          "usage_error" "use opensop status $run_id to inspect the run" ;;
+    *)
+      die "run $run_id has unexpected status '$mf_status' — cannot cancel" \
+          "cli_error" ;;
+  esac
+
+  local cancelled_at; cancelled_at="$(_local_now)"
+  local proc_name; proc_name="$(jq -r '.process' "$mf")"
+
+  # Append a cancelled receipt to audit.jsonl.
+  local audit="$run_dir/audit.jsonl"
+  jq -nc \
+    --arg rid "$run_id" \
+    --arg t   "$cancelled_at" \
+    --arg r   "$reason" \
+    '{run_id: $rid, step: null, type: "cancel", executor: "internal",
+      status: "cancelled", started_at: $t, ended_at: $t}
+     + (if $r != "" then {reason: $r} else {} end)' >> "$audit"
+
+  # Update manifest: set status=cancelled, clear waiting block, write ended_at.
+  jq -c \
+    --arg s "cancelled" \
+    --arg e "$cancelled_at" \
+    '.status=$s | .ended_at=$e | del(.waiting) | del(.cursor)' \
+    "$mf" > "$mf.tmp" && mv "$mf.tmp" "$mf"
+
+  if is_tty && [[ "$OUTPUT_MODE" != "json" ]]; then
+    ok "cancelled $proc_name $run_id"
+    [[ -n "$reason" ]] && info "  reason: $reason"
+  else
+    # Emit a normalized envelope matching the runtime's InstanceSerializer shape
+    # (GET /sop/:name/:id after cancel returns the same InstanceSerializer response).
+    # Keys: id, process.{name}, state, inputs, outputs, metadata, started_at,
+    #       completed_at, error — so local and remote JSON output are structurally identical.
+    jq -c '{
+      id:           .run_id,
+      process:      {name: .process},
+      state:        .status,
+      inputs:       (.inputs // {}),
+      outputs:      (.outputs // {}),
+      metadata:     (.metadata // {}),
+      started_at:   .started_at,
+      completed_at: .ended_at,
+      error:        null
+    }' "$mf" | emit_pretty_or_json
+  fi
+}
+
 # opensop runs  — list local runs (always local; the server analogue is `instances`)
 local_runs() {
-  [ -d "$OPENSOP_LOCAL_HOME/runs" ] || { info "(no local runs yet — opensop run <process.sop.json> --local)"; return 0; }
+  [ -d "$OPENSOP_LOCAL_HOME/runs" ] || { info "(no local runs yet — opensop run <process.sop.json>)"; return 0; }
   for d in "$OPENSOP_LOCAL_HOME"/runs/*/; do
     [ -f "$d/manifest.json" ] || continue
     jq -r '"\(.run_id)\t\(.status)\t\(.process)\t\(.started_at)"' "$d/manifest.json"
@@ -3204,18 +4042,46 @@ local_show() {
 main() {
   require_jq
 
-  # Strip global flags (--json / --pretty / --local / --help / --version) anywhere.
+  # Strip global flags anywhere in the argument list.
+  # v0.8: default backend is LOCAL. --remote uses the configured server URL;
+  # --server <url> sets the URL for this invocation and implies --remote.
+  # --local is accepted as a deprecated no-op (local is already the default).
   local -a args=()
-  for a in "$@"; do
-    case "$a" in
+  local _i=0 _all_args=("$@")
+  local _n="${#_all_args[@]}"
+  local _saw_local=false
+  while [[ $_i -lt $_n ]]; do
+    local _a="${_all_args[$_i]}"
+    case "$_a" in
       --json)              OUTPUT_MODE="json" ;;
       --pretty)            OUTPUT_MODE="pretty" ;;
-      --local)             LOCAL_MODE=true ;;
+      --local)
+        _saw_local=true
+        LOCAL_MODE=true  # kept for backward compat; does not change routing
+        ;;
+      --remote)            REMOTE_MODE=true ;;
+      --server)
+        # --server <url>: set URL for this invocation and enable remote mode.
+        _i=$((_i + 1))
+        if [[ $_i -lt $_n ]]; then
+          OPENSOP_URL="${_all_args[$_i]}"
+          REMOTE_MODE=true
+        else
+          die "--server requires a URL argument" "usage_error" "opensop --server <url> <command>"
+        fi
+        ;;
       --help|-h|help)      cmd_help; exit 0 ;;
       --version|-v|version) cmd_version; exit 0 ;;
-      *) args+=("$a") ;;
+      *) args+=("$_a") ;;
     esac
+    _i=$((_i + 1))
   done
+
+  # Emit the --local deprecation note now (after --json/--pretty are processed)
+  # so it doesn't pollute JSON output when --json is active.
+  if $_saw_local && [[ "$OUTPUT_MODE" != "json" ]]; then
+    printf 'note: --local is now the default and can be omitted\n' >&2
+  fi
 
   if (( ${#args[@]} == 0 )); then
     cmd_help; exit 0
@@ -3223,7 +4089,17 @@ main() {
   set -- "${args[@]}"
 
   local cmd="$1"; shift
-  load_config
+
+  # Config (~/.opensop) is only needed for the remote backend (OPENSOP_URL, OPENSOP_TOKEN).
+  # Local-mode runs are fully self-contained and never need the config file.
+  if [[ "$REMOTE_MODE" == true ]]; then
+    load_config
+    # --remote with no configured URL → helpful die.
+    if [[ -z "${OPENSOP_URL:-}" ]]; then
+      die "no remote server configured" "config_missing" \
+          "set one with: opensop config set url <URL>, or use --server <url>"
+    fi
+  fi
 
   # v0.6: when cwd is inside a cell AND the user didn't explicitly set
   # OPENSOP_LOCAL_HOME, default it to the active cell's .opensop/ so
@@ -3234,12 +4110,12 @@ main() {
     [[ -n "$_cell_for_runs" ]] && OPENSOP_LOCAL_HOME="$_cell_for_runs/.opensop"
   fi
 
-  # curl is only needed for the remote (server) backend. `runs`/`show` are always
-  # local, and any command with --local runs on-machine — none of them need curl.
-  case "$cmd" in
-    runs|show|init|scope|annotate|lineage|fork) ;;
-    *) [[ "$LOCAL_MODE" == true ]] || require_curl ;;
-  esac
+  # curl is only needed for the remote (server) backend.
+  # Local-default commands (runs, show, init, scope, annotate, lineage, fork,
+  # and all dual commands in local mode) need no curl.
+  if [[ "$REMOTE_MODE" == true ]]; then
+    require_curl
+  fi
 
   case "$cmd" in
     list)       cmd_list "$@" ;;
