@@ -24,17 +24,22 @@ The simplest pattern. The agent doesn't author processes; it just runs ones that
 ## OpenSOP processes
 
 When you have a multi-step task that someone has likely already turned into a
-process, check first: `opensop list` shows what's available. `opensop schema <name>`
-shows what a process expects.
+process, check first:
+
+  opensop list                          # local cell chain
+  opensop --remote list                 # server catalog (if configured)
+  opensop search <keyword>              # by intent (local or remote)
+  opensop schema <name>                 # full process definition (remote)
 
 If a process fits the task at hand, prefer running it over re-deriving the steps:
 
-  opensop run <name> --input key=value --input key2=value2
+  opensop run <name|file.sop.json> --input key=value  # local (default)
+  opensop --remote run <name> --input key=value        # remote server
 
-Then `opensop status <instance-id>` until it reaches `completed`. If a step is
-`waiting` (form / judgment / approval), advance it with:
+Then `opensop status <run_id>` until it reaches `completed`. If a step is
+`waiting` (form / approval / webhook), advance it with:
 
-  opensop submit <id> <step-id> --output key=value
+  opensop submit <run_id> <step-id> --output key=value
 
 This gives the work persistence and a receipt — better than ad-hoc execution.
 ```
@@ -129,17 +134,17 @@ Every run has a queryable history. If something failed, the agent can `opensop s
 
 ## Local execution — running processes without a server
 
-Since v0.5, the CLI has a `--local` backend that runs the same process files on-machine — no Rails app, no daemon, no `curl`. As of v0.7, the local backend supports all production step types.
+Since v0.5, the CLI has a local backend that runs the same process files on-machine — no Rails app, no daemon, no `curl`. As of v0.8, local is the **default** — no flag required. As of v0.7, the local backend supports all production step types.
 
-### When to use `--local`
+### When to use local vs. remote
 
-Use the local backend when the agent:
+Use the **local backend** (default) when the agent:
 
 - Is operating in a CI / air-gapped / edge environment with no OpenSOP server
 - Is developing or testing a new process file before registering it on a server
 - Needs lightweight one-off execution and the overhead of a running server is not justified
 
-For persistent audit trails shared across agents or humans, prefer the server backend.
+Use the **remote backend** (`--remote` or `--server <url>`) when you need persistent audit trails shared across agents or humans, or when running processes registered on a server.
 
 ### Pause/resume lifecycle
 
@@ -147,10 +152,10 @@ Some step types pause the run and wait for external input:
 
 | Step type | Pause reason | How to resume |
 |---|---|---|
-| `form` | `waiting_for_input` | `opensop submit <run_id> <step-id> --local --output k=v` |
-| `approval` | `waiting_for_approval` | `opensop submit <run_id> <step-id> --local --output decision=approve` |
-| `wait` (with `until:`) | `waiting_for_callback` | `opensop submit <run_id> <step-id> --local` |
-| `webhook` (callback mode) | `waiting_for_callback` | `opensop submit <run_id> <step-id> --local --output k=v` |
+| `form` | `waiting_for_input` | `opensop submit <run_id> <step-id> --output k=v` |
+| `approval` | `waiting_for_approval` | `opensop submit <run_id> <step-id> --output decision=approve` |
+| `wait` (with `until:`) | `waiting_for_callback` | `opensop submit <run_id> <step-id>` |
+| `webhook` (callback mode) | `waiting_for_callback` | `opensop submit <run_id> <step-id> --output k=v` |
 | `subprocess` | propagates child pause | resume the child, then the parent continues |
 
 When paused, `manifest.status` is `waiting` and `manifest.waiting` records the step, reason, and expected outputs. Execution resumes at `cursor.next_index` — never re-runs completed steps.
@@ -173,19 +178,21 @@ When paused, `manifest.status` is `waiting` and `manifest.waiting` records the s
 ### CLAUDE.md snippet for local-mode agents
 
 ```markdown
-## Running processes locally (no server)
+## Running OpenSOP processes (local by default — no server required)
 
-Use `--local` when there is no OpenSOP server available or when testing a new
-process file before registering it.
+opensop runs processes locally out of the box. No server, no curl, no config.
 
-  opensop run ./my-process.sop.json --local --input key=value
+  opensop run ./my-process.sop.json --input key=value
+  opensop run <bare-name>            # looks up processes/<name>.sop.json in the cell chain
 
 If the process has a `form`, `approval`, or `wait` step, the run pauses. Resume with:
 
-  opensop submit <run_id> <step-id> --local --output key=value
+  opensop submit <run_id> <step-id> --output key=value
 
 Check `opensop runs` to see all local runs. `opensop show <run_id>` shows the
 manifest + per-step receipts for a specific run.
+
+To use a remote server instead: add `--remote` (configured URL) or `--server <url>`.
 
 `llm` steps require `ANTHROPIC_API_KEY` in the environment.
 ```

@@ -7,7 +7,96 @@ This project follows [Semantic Versioning](https://semver.org/) and the
 
 ---
 
-## [Unreleased]
+## [0.8.0] — 2026-06-11
+
+> **BREAKING:** The default backend is now **LOCAL**. Commands that previously hit a remote server by default now run locally (no server, no curl). Scripts relying on the old default-remote behaviour must add `--remote` (uses the configured `OPENSOP_URL`) or `--server <url>`. The `--local` flag is now a deprecated no-op and can be omitted — it is still accepted for script compatibility but prints a deprecation note to stderr.
+>
+> **Migration:** any invocation of the form `opensop <cmd> [args]` that expected remote behaviour must become `opensop --remote <cmd> [args]` or `opensop --server <url> <cmd> [args]`.
+
+### Changed (breaking)
+
+- **Default backend flipped from REMOTE to LOCAL (U2a — Phase 2).**
+  `REMOTE_MODE` (default `false`) controls routing for all dual commands (`run`, `list`, `search`, `suggest`, `dry-run`, `status`, `steps`, `submit`, `cancel`, `diff`, `instances`, `compass`, `history`). `--remote` sets `REMOTE_MODE=true` and uses the configured `OPENSOP_URL`; `--server <url>` sets the URL for the invocation and implies `--remote`. `--local` is now a deprecated no-op alias — accepted without error but prints `note: --local is now the default and can be omitted` to stderr (suppressed in `--json` mode). `register` with no `--remote`/`--server` exits with `usage_error` directing users to pass one of these flags. `curl` is only invoked in REMOTE mode. Config (`~/.opensop`) is only loaded in REMOTE mode — local runs are fully self-contained.
+
+### Changed (non-breaking)
+
+- **Vocabulary unified on "run(s)" (U2b).**
+  User-facing messages, help text, and TTY output now say "run(s)" consistently instead of "instance(s)" for the local-default world. The `instances` command name is unchanged (it is an established verb), but its description now reads "list runs". Affected: `cmd_instances` pretty header, `local_instances` pretty header, `cmd_submit` TTY confirmation, resume hints, and usage-error strings in local engine functions.
+
+### Added (Phase 1 — local parity for all dual commands)
+
+- **`opensop cancel <run_id> [--reason TEXT]` — cancel a running or waiting local run (P1f).**
+  `cmd_cancel` branches to `local_cancel` when `REMOTE_MODE != true` (default; no server, no curl).
+  Only `running` or `waiting` runs can be cancelled — submitting cancel on a `completed`,
+  `failed`, or already-`cancelled` run is rejected with a `usage_error` (mirroring the
+  runtime's invalid-transition behaviour). On success: manifest `status` is set to
+  `"cancelled"`, the `waiting` and `cursor` blocks are cleared, `ended_at` is written,
+  and a `{type:"cancel", status:"cancelled", reason?}` receipt is appended to
+  `audit.jsonl`. Output shape mirrors `cmd_cancel` (pretty: `ok "cancelled …" + reason
+  line`; JSON: updated manifest piped through `emit_pretty_or_json`).
+
+- **`opensop diff <run_id1> <run_id2>` — compare two local runs (P1e).**
+  `cmd_diff` branches to `local_diff` when `REMOTE_MODE != true` (no server, no curl).
+  `local_diff` reads each run's `manifest.json` (for `state`/`inputs`/`metadata`),
+  `audit.jsonl` (for per-step receipts), and `context.json` (for final outputs), then
+  emits an identical shape to the remote diff response:
+  `{a:{id,state,started_at}, b:{id,state,started_at}, differences:[{path,a,b}], identical:true|false}`.
+  Compared fields mirror the remote: top-level `state`, `inputs`, `outputs` (final
+  context), `metadata`; per-step `state`, `sub_state`, `outputs`, `decided_by`,
+  `exit_code`, `duration_ms`. Same-process guard is enforced (diff across different
+  processes → `cli_error`). Unknown `run_id` → `die` with `instance_not_found`.
+  Pretty rendering mirrors `cmd_diff`'s TTY table (bold path, red a:, green b:).
+
+- **`opensop instances`, `opensop compass`, `opensop history --process <name>` — local admin views (P1d).**
+  `cmd_instances`, `cmd_compass`, and `cmd_history` branch to `local_instances`,
+  `local_compass`, and `local_history` when `REMOTE_MODE != true` (no server, no curl).
+  `local_instances` enumerates `$OPENSOP_LOCAL_HOME/runs/*/manifest.json`, applies
+  `--state`/`--process` filters and `--limit`/`--offset` pagination entirely in jq,
+  and emits `{instances:[{id, process:{name}, state, started_at}], total:N}` — an
+  identical shape to the remote `cmd_instances` response. `local_compass` applies the
+  same group-by-process jq logic as remote `cmd_compass`, producing
+  `{by_runs, by_recency, by_failure_rate}` from the local run corpus. `local_history`
+  delegates to `local_instances --process <name>`, mirroring how `cmd_history`
+  delegates to `cmd_instances`. All three route through `emit_pretty_or_json`; the
+  pretty paths mirror their remote counterparts' TTY rendering (coloured state, ranked
+  tables). Empty stores return empty arrays/zero totals, not errors.
+
+- **`opensop status <run_id>` and `opensop steps <run_id>` — local run inspection (P1c).**
+  `cmd_status` and `cmd_steps` branch to `local_status`/`local_steps` when
+  `REMOTE_MODE != true`. Both read `$OPENSOP_LOCAL_HOME/runs/<run_id>/manifest.json`
+  and `audit.jsonl` (no server, no curl). `local_status` emits a JSON shape
+  identical to the remote GET `/sop/:name/:id` response
+  (`{id, process:{name}, state, started_at, completed_at, waiting, steps}`),
+  including per-step `{step_id, type, state, sub_state}` derived from audit
+  receipts. `local_steps` emits `{run_id, steps:[...]}` with the full receipt
+  fields (`exit_code`, `output`, `started_at`, `ended_at`). Both route through
+  `emit_pretty_or_json`; the pretty path mirrors `cmd_status`'s TTY rendering
+  (colored state, glyph per step). Unknown `run_id` → `die` with `instance_not_found`.
+
+- **`opensop dry-run <name|file.sop.json>` — local process preview with input validation (P1b).**
+  `cmd_dry_run` branches to `local_dry_run` when `REMOTE_MODE != true`. The local
+  implementation resolves the process file via `_find_skill_in_cells` (bare name →
+  cell chain) or an explicit path, normalises the `.sop.json`'s `inputs` field to
+  array form, validates provided `--input`/`--inputs` against the declared schema
+  (required/type/enum/email-format — same jq logic as the remote validator), and
+  prints the step walkthrough via `walk_steps_preview`. No run directory is created.
+  Output shape (pretty prose / `{process, valid, validation_errors, steps}` JSON)
+  is identical to remote `cmd_dry_run`.
+
+- **`opensop search <kw...>` — ranked text search over the cell-chain process corpus (P1a).**
+  `cmd_search` branches to `local_search` when `REMOTE_MODE != true`. A shared
+  helper `_enumerate_local_processes` walks the active cell + ancestors (nearest
+  first, nearest-wins dedup by basename — same precedence as `list --conflicts`),
+  reads each `.sop.json`, and builds a `{processes:[...]}` object compatible with
+  the existing `score_processes` jq scorer. `local_search` scores against that
+  corpus, returns the top 5, and produces an output shape identical to remote
+  `cmd_search` (pretty table in a TTY, `{query, results}` JSON when piped).
+
+- **`opensop suggest "<task>" [--threshold N]` — intent scoring over the cell-chain process corpus (P1a).**
+  `cmd_suggest` branches to `local_suggest` when `REMOTE_MODE != true`. Uses the
+  same `_enumerate_local_processes` corpus and the same top-1 + confidence formula
+  as the remote path. Output shape (pretty prose / `{task, match}` JSON) is
+  identical to remote `cmd_suggest`. `--threshold` is supported.
 
 ---
 
@@ -424,6 +513,7 @@ work; v0.6 features only activate inside a cell.
 - `X-SOP-Token` auth header support.
 - `NO_COLOR` support.
 
+[0.8.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Chosen9115/opensop-cli/compare/v0.4.1...v0.5.0

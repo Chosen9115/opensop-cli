@@ -2310,4 +2310,1193 @@ echo "$u10_4b_out" | jq -e '.errors[]?.message | test("response_mode")' >/dev/nu
   || { echo "FAIL: u10-4b schema validate error should mention response_mode — got: $u10_4b_out"; exit 1; }
 echo "PASS: u10-4b — schema validate flags webhook step missing response_mode"
 
+# --------------------------------------------------------------------------- #
+# P1a: local_search + local_suggest — cell-chain process search (no server)
+#
+# Setup: a two-level cell chain (org → team). Each level has a process.
+# Assertions cover:
+#   search: match by name, description, tag; nearest-wins dedup; no-match path
+#   suggest: ranks relevant process; threshold filtering; no-match path
+# --------------------------------------------------------------------------- #
+ps_org="$OPENSOP_LOCAL_HOME/ps-org"
+ps_team="$ps_org/team"
+mkdir -p "$ps_team"
+( cd "$ps_org"  && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+( cd "$ps_team" && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+
+mkdir -p "$ps_org/processes" "$ps_team/processes"
+
+# Org-level process: lead-qualification (has tags + description)
+cat > "$ps_org/processes/lead-qualification.sop.json" <<'JSON'
+{
+  "name": "lead-qualification",
+  "description": "Score inbound leads based on email and company size",
+  "tags": ["sales", "crm"],
+  "inputs": [
+    { "name": "lead_email", "type": "string" },
+    { "name": "company_size", "type": "number" }
+  ],
+  "steps": [{ "id": "score", "type": "noop" }]
+}
+JSON
+
+# Team-level process: greet-customer (different domain)
+cat > "$ps_team/processes/greet-customer.sop.json" <<'JSON'
+{
+  "name": "greet-customer",
+  "description": "Send a welcome email to a new customer",
+  "tags": ["onboarding", "email"],
+  "inputs": [
+    { "name": "customer_name", "type": "string" },
+    { "name": "customer_email", "type": "string" }
+  ],
+  "steps": [{ "id": "send", "type": "noop" }]
+}
+JSON
+
+# Team-level process that shadows org's lead-qualification (same basename, different name)
+cat > "$ps_team/processes/lead-qualification.sop.json" <<'JSON'
+{
+  "name": "lead-qualification-v2",
+  "description": "Team-overridden lead scoring for enterprise",
+  "tags": ["sales", "enterprise"],
+  "inputs": [{ "name": "lead_email", "type": "string" }],
+  "steps": [{ "id": "score", "type": "noop" }]
+}
+JSON
+
+# (1) search by name token — should find lead-qualification-v2 (nearest, team's)
+ps_search1="$( cd "$ps_team" && env -u OPENSOP_LOCAL_HOME "$cli" search lead --local --json )"
+ps_s1_count="$(jq -r '.results | length' <<<"$ps_search1")"
+[ "$ps_s1_count" -ge 1 ] || { echo "FAIL: search 'lead' should return at least 1 result, got $ps_s1_count"; exit 1; }
+# Nearest-wins: team's lead-qualification-v2 must appear; org's must NOT (deduped by basename)
+ps_s1_names="$(jq -r '.results[].name' <<<"$ps_search1")"
+echo "$ps_s1_names" | grep -q "lead-qualification-v2" \
+  || { echo "FAIL: search 'lead' should include team's lead-qualification-v2"; exit 1; }
+echo "$ps_s1_names" | grep -q "^lead-qualification$" \
+  && { echo "FAIL: search 'lead' should NOT show org's lead-qualification (deduped by team's nearest-wins)"; exit 1; }
+echo "PASS: search --local — matches by name; nearest-wins dedup hides shadowed org process"
+
+# (2) search by description keyword
+ps_search2="$( cd "$ps_team" && env -u OPENSOP_LOCAL_HOME "$cli" search welcome --local --json )"
+ps_s2_count="$(jq -r '.results | length' <<<"$ps_search2")"
+[ "$ps_s2_count" -ge 1 ] || { echo "FAIL: search 'welcome' should find greet-customer"; exit 1; }
+jq -e '.results[] | select(.name == "greet-customer")' <<<"$ps_search2" >/dev/null \
+  || { echo "FAIL: search 'welcome' should match greet-customer via description"; exit 1; }
+echo "PASS: search --local — matches by description keyword"
+
+# (3) search by tag
+ps_search3="$( cd "$ps_team" && env -u OPENSOP_LOCAL_HOME "$cli" search enterprise --local --json )"
+ps_s3_count="$(jq -r '.results | length' <<<"$ps_search3")"
+[ "$ps_s3_count" -ge 1 ] || { echo "FAIL: search 'enterprise' should find team's lead process"; exit 1; }
+jq -e '.results[] | select(.name == "lead-qualification-v2")' <<<"$ps_search3" >/dev/null \
+  || { echo "FAIL: search 'enterprise' should match lead-qualification-v2 via tag"; exit 1; }
+echo "PASS: search --local — matches by tag"
+
+# (4) search by input field name
+ps_search4="$( cd "$ps_team" && env -u OPENSOP_LOCAL_HOME "$cli" search customer_name --local --json )"
+ps_s4_count="$(jq -r '.results | length' <<<"$ps_search4")"
+[ "$ps_s4_count" -ge 1 ] || { echo "FAIL: search 'customer_name' should find greet-customer"; exit 1; }
+jq -e '.results[] | select(.name == "greet-customer")' <<<"$ps_search4" >/dev/null \
+  || { echo "FAIL: search 'customer_name' should match greet-customer via input field name"; exit 1; }
+echo "PASS: search --local — matches by input field name"
+
+# (5) output JSON shape: {query: [...], results: [{name, score, description, tags}, ...]}
+ps_shape="$( cd "$ps_team" && env -u OPENSOP_LOCAL_HOME "$cli" search lead --local --json )"
+jq -e 'has("query") and has("results")' <<<"$ps_shape" >/dev/null \
+  || { echo "FAIL: search --local --json output shape should have query + results keys"; exit 1; }
+jq -e '.results[0] | has("name") and has("score") and has("description") and has("tags")' <<<"$ps_shape" >/dev/null \
+  || { echo "FAIL: search --local --json result item missing name/score/description/tags"; exit 1; }
+echo "PASS: search --local — output JSON shape matches remote cmd_search"
+
+# (6) failure path: no match → exit 0, empty results (same convention as remote)
+set +e
+ps_nomatch_out="$( cd "$ps_team" && env -u OPENSOP_LOCAL_HOME "$cli" search xyzzy-no-match --local --json 2>/dev/null )"; ps_nomatch_rc=$?
+set -e
+[ "$ps_nomatch_rc" -eq 0 ] || { echo "FAIL: search --local with no match should exit 0 (not an error), got $ps_nomatch_rc"; exit 1; }
+echo "PASS: search --local — no-match exits 0 (not an error)"
+
+# (7) suggest: relevant task description → top-1 match with confidence
+ps_sug1="$( cd "$ps_team" && env -u OPENSOP_LOCAL_HOME "$cli" suggest "qualify sales lead by email" --local --json )"
+jq -e '.match != null' <<<"$ps_sug1" >/dev/null \
+  || { echo "FAIL: suggest 'qualify sales lead' should return a non-null match"; exit 1; }
+jq -e '.match.name | test("lead")' <<<"$ps_sug1" >/dev/null \
+  || { echo "FAIL: suggest 'qualify sales lead' should match a lead process"; exit 1; }
+jq -e '.match.confidence > 0' <<<"$ps_sug1" >/dev/null \
+  || { echo "FAIL: suggest match.confidence should be > 0"; exit 1; }
+echo "PASS: suggest --local — ranks relevant process for intent query"
+
+# (8) suggest output JSON shape: {task: "...", match: {name, confidence, description}}
+jq -e 'has("task") and has("match")' <<<"$ps_sug1" >/dev/null \
+  || { echo "FAIL: suggest --local --json output should have task + match keys"; exit 1; }
+jq -e '.match | has("name") and has("confidence") and has("description")' <<<"$ps_sug1" >/dev/null \
+  || { echo "FAIL: suggest --local --json match missing name/confidence/description"; exit 1; }
+echo "PASS: suggest --local — output JSON shape matches remote cmd_suggest"
+
+# (9) suggest with --threshold: if threshold too high, match becomes null
+ps_sug_high="$( cd "$ps_team" && env -u OPENSOP_LOCAL_HOME "$cli" suggest "qualify lead" --local --threshold 9999 --json )"
+jq -e '.match == null' <<<"$ps_sug_high" >/dev/null \
+  || { echo "FAIL: suggest --threshold 9999 should return null match (bar too high)"; exit 1; }
+echo "PASS: suggest --local --threshold — high threshold returns null match"
+
+# (10) suggest failure path: no processes at all → null match, exit 0
+empty_cell="$OPENSOP_LOCAL_HOME/ps-empty"
+mkdir -p "$empty_cell"
+( cd "$empty_cell" && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+set +e
+ps_sug_empty="$( cd "$empty_cell" && env -u OPENSOP_LOCAL_HOME "$cli" suggest "do something" --local --json 2>/dev/null )"; ps_sug_empty_rc=$?
+set -e
+[ "$ps_sug_empty_rc" -eq 0 ] || { echo "FAIL: suggest --local in empty cell should exit 0, got $ps_sug_empty_rc"; exit 1; }
+jq -e '.match == null' <<<"$ps_sug_empty" >/dev/null \
+  || { echo "FAIL: suggest --local in empty cell should have null match"; exit 1; }
+echo "PASS: suggest --local — empty corpus yields null match, exits 0"
+
+# (11) search NOT inside a cell (no cell chain): still works, searches nothing → no match
+set +e
+ps_nocell_out="$( cd "$OPENSOP_LOCAL_HOME" && env -u OPENSOP_LOCAL_HOME "$cli" search lead --local --json 2>/dev/null )"; ps_nocell_rc=$?
+set -e
+[ "$ps_nocell_rc" -eq 0 ] || { echo "FAIL: search --local outside any cell should exit 0, got $ps_nocell_rc"; exit 1; }
+echo "PASS: search --local — outside any cell exits 0 (no corpus, no error)"
+
+# --------------------------------------------------------------------------- #
+# P1b: local_dry_run — local process preview + input validation (no run created)
+#
+# Assertions:
+#   - valid inputs → JSON output matches remote dry-run shape (process, valid, validation_errors, steps)
+#   - valid inputs → exit 0
+#   - missing required input → validation_errors non-empty, valid=false, exit 1
+#   - wrong type for a field → validation_errors non-empty, valid=false, exit 1
+#   - by name (cell-chain resolution) works the same as explicit path
+#   - no run dir created for any dry-run call
+# --------------------------------------------------------------------------- #
+dr_dir="$OPENSOP_LOCAL_HOME/dry-run-test"
+mkdir -p "$dr_dir"
+
+# Process with typed + required inputs and a few steps
+cat > "$dr_dir/qualify.sop.json" <<'JSON'
+{
+  "name": "lead-qualify",
+  "description": "Qualify a lead",
+  "inputs": [
+    { "name": "lead_email", "type": "string",  "required": true, "format": "email" },
+    { "name": "score",      "type": "number",  "required": true },
+    { "name": "opt_in",     "type": "boolean", "required": false }
+  ],
+  "steps": [
+    { "id": "check",  "type": "noop" },
+    { "id": "notify", "type": "form",
+      "inputs": [{ "name": "decision", "type": "enum", "values": ["qualify","reject"], "required": true }] }
+  ]
+}
+JSON
+
+runs_before_dry=$(ls "$OPENSOP_LOCAL_HOME/runs" 2>/dev/null | wc -l | tr -d ' ')
+
+# (1) Happy path: valid inputs → exit 0, valid=true, correct JSON shape
+dr_happy="$("$cli" dry-run "$dr_dir/qualify.sop.json" --local \
+  --input lead_email=alice@example.com \
+  --input score=42 \
+  --json)"
+[ "$(jq -r '.valid' <<<"$dr_happy")" = "true" ] \
+  || { echo "FAIL: dry-run --local valid inputs should produce valid=true, got: $(jq -r '.valid' <<<"$dr_happy")"; exit 1; }
+echo "PASS: dry-run --local — valid inputs → valid=true"
+
+[ "$(jq -r '.process' <<<"$dr_happy")" = "lead-qualify" ] \
+  || { echo "FAIL: dry-run --local .process should be 'lead-qualify'"; exit 1; }
+echo "PASS: dry-run --local — .process name correct"
+
+[ "$(jq -r '.validation_errors | length' <<<"$dr_happy")" = "0" ] \
+  || { echo "FAIL: dry-run --local valid inputs should have empty validation_errors"; exit 1; }
+echo "PASS: dry-run --local — validation_errors is empty for valid inputs"
+
+[ "$(jq -r '.steps | length' <<<"$dr_happy")" = "2" ] \
+  || { echo "FAIL: dry-run --local .steps should have 2 entries, got $(jq -r '.steps | length' <<<"$dr_happy")"; exit 1; }
+echo "PASS: dry-run --local — .steps array has 2 entries (mirrors remote shape)"
+
+jq -e '.steps[0] | has("step_id") and has("type") and has("preview")' <<<"$dr_happy" >/dev/null \
+  || { echo "FAIL: dry-run --local step item missing step_id/type/preview keys"; exit 1; }
+echo "PASS: dry-run --local — step item has step_id, type, preview keys"
+
+jq -e 'has("process") and has("valid") and has("validation_errors") and has("steps")' \
+  <<<"$dr_happy" >/dev/null \
+  || { echo "FAIL: dry-run --local JSON output missing top-level keys"; exit 1; }
+echo "PASS: dry-run --local — JSON shape matches remote cmd_dry_run"
+
+# (2) Confirm no run directory was created for a successful dry-run
+runs_after_dry=$(ls "$OPENSOP_LOCAL_HOME/runs" 2>/dev/null | wc -l | tr -d ' ')
+[ "$runs_before_dry" = "$runs_after_dry" ] \
+  || { echo "FAIL: dry-run --local should not create any run directory"; exit 1; }
+echo "PASS: dry-run --local — no run directory created"
+
+# (3) Failure path: missing required field → exit 1, valid=false, error listed
+set +e
+dr_missing="$("$cli" dry-run "$dr_dir/qualify.sop.json" --local \
+  --input score=42 \
+  --json)"; dr_missing_rc=$?
+set -e
+[ "$dr_missing_rc" -ne 0 ] \
+  || { echo "FAIL: dry-run --local with missing required input should exit non-zero, got $dr_missing_rc"; exit 1; }
+echo "PASS: dry-run --local — missing required field exits non-zero"
+
+[ "$(jq -r '.valid' <<<"$dr_missing")" = "false" ] \
+  || { echo "FAIL: dry-run --local missing field should have valid=false"; exit 1; }
+echo "PASS: dry-run --local — valid=false when required field missing"
+
+[ "$(jq -r '.validation_errors | length' <<<"$dr_missing")" -ge 1 ] \
+  || { echo "FAIL: dry-run --local missing field should have ≥1 validation_error"; exit 1; }
+echo "PASS: dry-run --local — validation_errors non-empty when required field missing"
+
+jq -e '.validation_errors[] | select(.message | test("lead_email"))' <<<"$dr_missing" >/dev/null \
+  || { echo "FAIL: dry-run --local missing-email error should mention 'lead_email'"; exit 1; }
+echo "PASS: dry-run --local — error message identifies the missing required field"
+
+# (4) Failure path: wrong type for number field → exit 1, error in validation_errors
+set +e
+dr_badtype="$("$cli" dry-run "$dr_dir/qualify.sop.json" --local \
+  --input lead_email=alice@example.com \
+  --input score=not-a-number \
+  --json)"; dr_badtype_rc=$?
+set -e
+[ "$dr_badtype_rc" -ne 0 ] \
+  || { echo "FAIL: dry-run --local wrong type should exit non-zero, got $dr_badtype_rc"; exit 1; }
+[ "$(jq -r '.valid' <<<"$dr_badtype")" = "false" ] \
+  || { echo "FAIL: dry-run --local wrong type should have valid=false"; exit 1; }
+jq -e '.validation_errors[] | select(.message | test("score"))' <<<"$dr_badtype" >/dev/null \
+  || { echo "FAIL: dry-run --local type error should mention 'score'"; exit 1; }
+echo "PASS: dry-run --local — wrong type field exits non-zero with error mentioning the field"
+
+# (5) Failure path: bad email format → validation error even when type=string
+set +e
+dr_bademail="$("$cli" dry-run "$dr_dir/qualify.sop.json" --local \
+  --input lead_email=not-an-email \
+  --input score=42 \
+  --json)"; dr_bademail_rc=$?
+set -e
+[ "$dr_bademail_rc" -ne 0 ] \
+  || { echo "FAIL: dry-run --local bad email format should exit non-zero, got $dr_bademail_rc"; exit 1; }
+jq -e '.validation_errors[] | select(.message | test("email"))' <<<"$dr_bademail" >/dev/null \
+  || { echo "FAIL: dry-run --local bad email should produce an email-related error"; exit 1; }
+echo "PASS: dry-run --local — bad email format exits non-zero with email error"
+
+# (6) Cell-chain name resolution: dry-run by bare name from inside a cell
+dr_cell_dir="$OPENSOP_LOCAL_HOME/dr-cell"
+mkdir -p "$dr_cell_dir/processes"
+( cd "$dr_cell_dir" && env -u OPENSOP_LOCAL_HOME "$cli" init --json >/dev/null )
+cp "$dr_dir/qualify.sop.json" "$dr_cell_dir/processes/qualify.sop.json"
+
+dr_name="$( cd "$dr_cell_dir" && env -u OPENSOP_LOCAL_HOME \
+  "$cli" dry-run qualify --local \
+  --input lead_email=bob@example.com \
+  --input score=10 \
+  --json )"
+[ "$(jq -r '.valid' <<<"$dr_name")" = "true" ] \
+  || { echo "FAIL: dry-run --local by bare name should resolve from cell and produce valid=true"; exit 1; }
+[ "$(jq -r '.process' <<<"$dr_name")" = "lead-qualify" ] \
+  || { echo "FAIL: dry-run --local by bare name should have process='lead-qualify'"; exit 1; }
+echo "PASS: dry-run --local — bare name resolves via cell chain (nearest wins)"
+
+# (7) Failure path: name not found → non-zero exit
+set +e
+( cd "$dr_cell_dir" && env -u OPENSOP_LOCAL_HOME \
+  "$cli" dry-run no-such-process --local --json >/dev/null 2>&1 ); dr_nofile_rc=$?
+set -e
+[ "$dr_nofile_rc" -ne 0 ] \
+  || { echo "FAIL: dry-run --local with unresolvable name should exit non-zero"; exit 1; }
+echo "PASS: dry-run --local — unresolvable process name exits non-zero"
+
+# (8) Process with object-style inputs (dict instead of array) — normalised correctly
+cat > "$dr_dir/dict-inputs.sop.json" <<'JSON'
+{
+  "name": "dict-process",
+  "inputs": {
+    "name": { "type": "string", "required": true },
+    "count": { "type": "number" }
+  },
+  "steps": [{ "id": "go", "type": "noop" }]
+}
+JSON
+
+dr_dict="$("$cli" dry-run "$dr_dir/dict-inputs.sop.json" --local \
+  --input name=alice \
+  --json)"
+[ "$(jq -r '.valid' <<<"$dr_dict")" = "true" ] \
+  || { echo "FAIL: dry-run --local dict-style inputs should validate correctly"; exit 1; }
+echo "PASS: dry-run --local — object-style inputs normalised and validated correctly"
+
+# --------------------------------------------------------------------------- #
+# P1c: local_status + local_steps — inspect local runs (no server)
+# --------------------------------------------------------------------------- #
+echo "--- P1c: local_status + local_steps ---"
+
+# Re-use the already-completed greet run (run_id is in $run_id from the top
+# of the file; $OPENSOP_LOCAL_HOME still points to the same tempdir).
+
+# (1) status of a completed run
+p1c_status="$("$cli" status "$run_id" --local --json)"
+[ "$(jq -r '.id' <<<"$p1c_status")" = "$run_id" ] \
+  || { echo "FAIL: status --local .id should equal run_id, got: $(jq -r '.id' <<<"$p1c_status")"; exit 1; }
+echo "PASS: status --local — .id matches run_id"
+
+[ "$(jq -r '.state' <<<"$p1c_status")" = "completed" ] \
+  || { echo "FAIL: status --local completed run should have state=completed, got: $(jq -r '.state' <<<"$p1c_status")"; exit 1; }
+echo "PASS: status --local — completed run has state=completed"
+
+[ "$(jq -r '.process.name' <<<"$p1c_status")" = "greet" ] \
+  || { echo "FAIL: status --local .process.name should be 'greet', got: $(jq -r '.process.name' <<<"$p1c_status")"; exit 1; }
+echo "PASS: status --local — .process.name is correct"
+
+jq -e '.completed_at != null' <<<"$p1c_status" >/dev/null \
+  || { echo "FAIL: status --local completed run should have completed_at set"; exit 1; }
+echo "PASS: status --local — completed run has completed_at"
+
+# steps array: two entries (build + render), both completed
+[ "$(jq '.steps | length' <<<"$p1c_status")" -eq 2 ] \
+  || { echo "FAIL: status --local greet steps should be 2, got: $(jq '.steps | length' <<<"$p1c_status")"; exit 1; }
+echo "PASS: status --local — steps array has 2 entries"
+
+jq -e '.steps[] | select(.step_id == "build" and .state == "completed")' <<<"$p1c_status" >/dev/null \
+  || { echo "FAIL: status --local build step should be completed"; exit 1; }
+echo "PASS: status --local — build step is completed"
+
+jq -e '.steps[] | select(.step_id == "render" and .state == "completed")' <<<"$p1c_status" >/dev/null \
+  || { echo "FAIL: status --local render step should be completed"; exit 1; }
+echo "PASS: status --local — render step is completed"
+
+# step item shape: must have step_id, type, state (mirrors remote cmd_status shape)
+jq -e '.steps[0] | has("step_id") and has("type") and has("state")' <<<"$p1c_status" >/dev/null \
+  || { echo "FAIL: status --local step item missing step_id/type/state keys"; exit 1; }
+echo "PASS: status --local — step item has step_id, type, state (mirrors remote shape)"
+
+# top-level shape: id, process, state, started_at
+jq -e 'has("id") and has("process") and has("state") and has("started_at")' <<<"$p1c_status" >/dev/null \
+  || { echo "FAIL: status --local JSON missing required top-level keys"; exit 1; }
+echo "PASS: status --local — JSON shape matches remote cmd_status"
+
+# (2) status of a waiting run — shows the waiting step
+p1c_wait_proc="$OPENSOP_LOCAL_HOME/p1c-wait.sop.json"
+cat > "$p1c_wait_proc" <<'JSON'
+{ "name": "p1c-wait-test", "inputs": {},
+  "steps": [
+    { "id": "before", "type": "shell", "run": "echo pre" },
+    { "id": "pause",  "type": "form",  "inputs": [{"name":"answer","type":"string","required":true}] },
+    { "id": "after",  "type": "noop" }
+  ] }
+JSON
+p1c_wait_m="$("$cli" run "$p1c_wait_proc" --local --json)"
+p1c_wait_id="$(jq -r '.run_id' <<<"$p1c_wait_m")"
+[ "$(jq -r '.status' <<<"$p1c_wait_m")" = "waiting" ] \
+  || { echo "FAIL: p1c-wait run should be in waiting status"; exit 1; }
+
+p1c_wait_s="$("$cli" status "$p1c_wait_id" --local --json)"
+[ "$(jq -r '.state' <<<"$p1c_wait_s")" = "waiting" ] \
+  || { echo "FAIL: status --local waiting run should have state=waiting, got: $(jq -r '.state' <<<"$p1c_wait_s")"; exit 1; }
+echo "PASS: status --local — waiting run has state=waiting"
+
+# The waiting step (pause) appears in steps with state=waiting
+jq -e '.steps[] | select(.step_id == "pause" and .state == "waiting")' <<<"$p1c_wait_s" >/dev/null \
+  || { echo "FAIL: status --local waiting run: pause step should have state=waiting"; exit 1; }
+echo "PASS: status --local — waiting run shows paused step with state=waiting"
+
+# sub_state should be waiting_for_input (form step)
+jq -e '.steps[] | select(.step_id == "pause") | .sub_state == "waiting_for_input"' <<<"$p1c_wait_s" >/dev/null \
+  || { echo "FAIL: status --local form step sub_state should be waiting_for_input"; exit 1; }
+echo "PASS: status --local — waiting form step has sub_state=waiting_for_input"
+
+# waiting block propagated from manifest
+jq -e '.waiting != null' <<<"$p1c_wait_s" >/dev/null \
+  || { echo "FAIL: status --local waiting run should have non-null .waiting block"; exit 1; }
+echo "PASS: status --local — waiting block present in status response"
+
+# completed_at must be null for a still-waiting run
+[ "$(jq -r '.completed_at' <<<"$p1c_wait_s")" = "null" ] \
+  || { echo "FAIL: status --local waiting run should have null completed_at, got: $(jq -r '.completed_at' <<<"$p1c_wait_s")"; exit 1; }
+echo "PASS: status --local — waiting run has null completed_at"
+
+# (3) local_steps — step list with full receipt fields
+p1c_steps="$("$cli" steps "$run_id" --local --json)"
+[ "$(jq -r '.run_id' <<<"$p1c_steps")" = "$run_id" ] \
+  || { echo "FAIL: steps --local .run_id should match, got: $(jq -r '.run_id' <<<"$p1c_steps")"; exit 1; }
+echo "PASS: steps --local — .run_id matches"
+
+[ "$(jq '.steps | length' <<<"$p1c_steps")" -eq 2 ] \
+  || { echo "FAIL: steps --local should list 2 steps, got: $(jq '.steps | length' <<<"$p1c_steps")"; exit 1; }
+echo "PASS: steps --local — lists 2 steps"
+
+# Steps from steps command should have step_id, type, state
+jq -e '.steps[0] | has("step_id") and has("type") and has("state")' <<<"$p1c_steps" >/dev/null \
+  || { echo "FAIL: steps --local item missing step_id/type/state"; exit 1; }
+echo "PASS: steps --local — step item has step_id, type, state"
+
+# top-level shape: run_id + steps
+jq -e 'has("run_id") and has("steps")' <<<"$p1c_steps" >/dev/null \
+  || { echo "FAIL: steps --local output missing run_id or steps key"; exit 1; }
+echo "PASS: steps --local — output shape has run_id and steps"
+
+# steps also have exit_code and output (full receipt fields)
+jq -e '.steps[] | select(.step_id == "build") | has("exit_code") and has("output")' <<<"$p1c_steps" >/dev/null \
+  || { echo "FAIL: steps --local build step missing exit_code or output"; exit 1; }
+echo "PASS: steps --local — step receipt has exit_code and output fields"
+
+# steps also have decided_by and confidence (mirrors remote StepSerializer)
+jq -e '.steps[0] | has("decided_by") and has("confidence")' <<<"$p1c_steps" >/dev/null \
+  || { echo "FAIL: steps --local step receipt missing decided_by or confidence (should mirror remote StepSerializer)"; exit 1; }
+echo "PASS: steps --local — step receipt has decided_by and confidence fields (mirrors remote StepSerializer)"
+
+# (4) Failure path: unknown run_id → error with instance_not_found code
+set +e
+p1c_bad_s="$("$cli" status "no-such-run-xyz" --local --json 2>&1)"; p1c_bad_rc=$?
+set -e
+[ "$p1c_bad_rc" -ne 0 ] \
+  || { echo "FAIL: status --local with unknown run_id should exit non-zero"; exit 1; }
+echo "PASS: status --local — unknown run_id exits non-zero"
+
+echo "$p1c_bad_s" | jq -e '.error == "instance_not_found"' >/dev/null \
+  || { echo "FAIL: status --local unknown run_id should emit instance_not_found error code, got: $p1c_bad_s"; exit 1; }
+echo "PASS: status --local — unknown run_id emits instance_not_found error code"
+
+set +e
+p1c_bad_st="$("$cli" steps "no-such-run-xyz" --local --json 2>&1)"; p1c_bad_st_rc=$?
+set -e
+[ "$p1c_bad_st_rc" -ne 0 ] \
+  || { echo "FAIL: steps --local with unknown run_id should exit non-zero"; exit 1; }
+echo "PASS: steps --local — unknown run_id exits non-zero"
+
+# --------------------------------------------------------------------------- #
+# P1d: local_instances + local_compass + local_history
+#
+# Setup: use a DEDICATED OPENSOP_LOCAL_HOME so the exact run count is
+# deterministic and independent of all prior test sections.
+# --------------------------------------------------------------------------- #
+p1d_home="$(mktemp -d)"
+p1d_dir="$p1d_home/procs"
+mkdir -p "$p1d_dir"
+
+# Process A: 3 runs — 2 completed, 1 failed
+cat > "$p1d_dir/proc-a.sop.json" <<'JSON'
+{ "name": "proc-a", "inputs": {},
+  "steps": [ { "id": "run", "type": "shell", "run": "echo done" } ] }
+JSON
+cat > "$p1d_dir/proc-a-fail.sop.json" <<'JSON'
+{ "name": "proc-a", "inputs": {},
+  "steps": [ { "id": "run", "type": "shell", "run": "exit 1" } ] }
+JSON
+
+# Process B: 1 completed run
+cat > "$p1d_dir/proc-b.sop.json" <<'JSON'
+{ "name": "proc-b", "inputs": {},
+  "steps": [ { "id": "run", "type": "shell", "run": "echo b-done" } ] }
+JSON
+
+# Process C: 1 waiting run (form step)
+cat > "$p1d_dir/proc-c.sop.json" <<'JSON'
+{ "name": "proc-c", "inputs": {},
+  "steps": [
+    { "id": "gate", "type": "form",
+      "inputs": [ { "name": "val", "type": "string", "required": true } ] }
+  ] }
+JSON
+
+p1d_a1=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" run "$p1d_dir/proc-a.sop.json" --local --json)
+p1d_a1_id=$(jq -r '.run_id' <<<"$p1d_a1")
+
+p1d_a2=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" run "$p1d_dir/proc-a.sop.json" --local --json)
+p1d_a2_id=$(jq -r '.run_id' <<<"$p1d_a2")
+
+set +e
+p1d_a3=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" run "$p1d_dir/proc-a-fail.sop.json" --local --json); p1d_a3_rc=$?
+set -e
+p1d_a3_id=$(jq -r '.run_id' <<<"$p1d_a3")
+
+p1d_b1=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" run "$p1d_dir/proc-b.sop.json" --local --json)
+p1d_b1_id=$(jq -r '.run_id' <<<"$p1d_b1")
+
+set +e
+p1d_c1=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" run "$p1d_dir/proc-c.sop.json" --local --json); p1d_c1_rc=$?
+set -e
+p1d_c1_id=$(jq -r '.run_id' <<<"$p1d_c1")
+
+# Sanity-check the setup runs
+[ "$(jq -r '.status' <<<"$p1d_a1")" = "completed" ] || { echo "FAIL: p1d proc-a run1 should be completed"; exit 1; }
+[ "$(jq -r '.status' <<<"$p1d_a2")" = "completed" ] || { echo "FAIL: p1d proc-a run2 should be completed"; exit 1; }
+[ "$(jq -r '.status' <<<"$p1d_a3")" = "failed"    ] || { echo "FAIL: p1d proc-a run3 should be failed"; exit 1; }
+[ "$(jq -r '.status' <<<"$p1d_b1")" = "completed" ] || { echo "FAIL: p1d proc-b run1 should be completed"; exit 1; }
+[ "$(jq -r '.status' <<<"$p1d_c1")" = "waiting"   ] || { echo "FAIL: p1d proc-c run1 should be waiting"; exit 1; }
+echo "PASS: p1d — setup runs created (2 proc-a completed, 1 proc-a failed, 1 proc-b, 1 proc-c waiting)"
+
+# --------------------------------------------------------------------------- #
+# (1) local_instances — no filter: all 5 runs returned
+# --------------------------------------------------------------------------- #
+p1d_all=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" instances --local --json)
+
+# JSON shape: {instances:[...], total:N}
+jq -e 'has("instances") and has("total")' <<<"$p1d_all" >/dev/null \
+  || { echo "FAIL: instances --local missing 'instances' or 'total' key"; exit 1; }
+echo "PASS: instances --local — JSON shape has 'instances' and 'total'"
+
+[ "$(jq '.total' <<<"$p1d_all")" -eq 5 ] \
+  || { echo "FAIL: instances --local total should be 5, got: $(jq '.total' <<<"$p1d_all")"; exit 1; }
+echo "PASS: instances --local — total is 5 (all runs)"
+
+[ "$(jq '.instances | length' <<<"$p1d_all")" -eq 5 ] \
+  || { echo "FAIL: instances --local instances array should have 5 entries, got $(jq '.instances | length' <<<"$p1d_all")"; exit 1; }
+echo "PASS: instances --local — instances array has 5 entries"
+
+# Each instance has {id, process:{name}, state, started_at}
+jq -e '.instances[0] | has("id") and has("process") and has("state") and has("started_at")' <<<"$p1d_all" >/dev/null \
+  || { echo "FAIL: instances --local entry missing required keys"; exit 1; }
+echo "PASS: instances --local — each entry has id, process, state, started_at"
+
+jq -e '.instances[0].process | has("name")' <<<"$p1d_all" >/dev/null \
+  || { echo "FAIL: instances --local entry.process missing 'name'"; exit 1; }
+echo "PASS: instances --local — each entry.process has name"
+
+# --------------------------------------------------------------------------- #
+# (2) local_instances --state completed: only completed runs
+# --------------------------------------------------------------------------- #
+p1d_completed=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" instances --local --state completed --json)
+[ "$(jq '.total' <<<"$p1d_completed")" -eq 3 ] \
+  || { echo "FAIL: instances --local --state completed should total 3, got $(jq '.total' <<<"$p1d_completed")"; exit 1; }
+echo "PASS: instances --local --state completed — total is 3"
+
+jq -e '.instances | all(.state == "completed")' <<<"$p1d_completed" >/dev/null \
+  || { echo "FAIL: instances --local --state completed returned non-completed entries"; exit 1; }
+echo "PASS: instances --local --state completed — all entries have state=completed"
+
+# --------------------------------------------------------------------------- #
+# (3) local_instances --state failed: only failed runs
+# --------------------------------------------------------------------------- #
+p1d_failed=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" instances --local --state failed --json)
+[ "$(jq '.total' <<<"$p1d_failed")" -eq 1 ] \
+  || { echo "FAIL: instances --local --state failed should total 1, got $(jq '.total' <<<"$p1d_failed")"; exit 1; }
+echo "PASS: instances --local --state failed — total is 1"
+
+# --------------------------------------------------------------------------- #
+# (4) local_instances --process proc-a: only proc-a runs (3 total)
+# --------------------------------------------------------------------------- #
+p1d_proca=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" instances --local --process proc-a --json)
+[ "$(jq '.total' <<<"$p1d_proca")" -eq 3 ] \
+  || { echo "FAIL: instances --local --process proc-a total should be 3, got $(jq '.total' <<<"$p1d_proca")"; exit 1; }
+echo "PASS: instances --local --process proc-a — total is 3"
+
+jq -e '.instances | all(.process.name == "proc-a")' <<<"$p1d_proca" >/dev/null \
+  || { echo "FAIL: instances --local --process proc-a returned non-proc-a entries"; exit 1; }
+echo "PASS: instances --local --process proc-a — all entries are proc-a"
+
+# --------------------------------------------------------------------------- #
+# (5) local_instances --process + --state combined
+# --------------------------------------------------------------------------- #
+p1d_proca_fail=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" instances --local --process proc-a --state failed --json)
+[ "$(jq '.total' <<<"$p1d_proca_fail")" -eq 1 ] \
+  || { echo "FAIL: instances --local --process proc-a --state failed should total 1, got $(jq '.total' <<<"$p1d_proca_fail")"; exit 1; }
+echo "PASS: instances --local — combined --process + --state filters work"
+
+# --------------------------------------------------------------------------- #
+# (6) local_instances pagination: --limit 2 --offset 0
+# --------------------------------------------------------------------------- #
+p1d_page1=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" instances --local --limit 2 --offset 0 --json)
+[ "$(jq '.instances | length' <<<"$p1d_page1")" -eq 2 ] \
+  || { echo "FAIL: instances --local --limit 2 should return 2 entries, got $(jq '.instances | length' <<<"$p1d_page1")"; exit 1; }
+[ "$(jq '.total' <<<"$p1d_page1")" -eq 5 ] \
+  || { echo "FAIL: instances --local --limit 2 total should still be 5, got $(jq '.total' <<<"$p1d_page1")"; exit 1; }
+echo "PASS: instances --local — --limit 2 returns 2 entries, total still 5"
+
+# page 2: --offset 2 returns the remaining 2 (not 3, as limit=2)
+p1d_page2=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" instances --local --limit 2 --offset 2 --json)
+[ "$(jq '.instances | length' <<<"$p1d_page2")" -eq 2 ] \
+  || { echo "FAIL: instances --local --offset 2 --limit 2 should return 2 entries, got $(jq '.instances | length' <<<"$p1d_page2")"; exit 1; }
+echo "PASS: instances --local — pagination --offset 2 --limit 2 returns 2 entries"
+
+# --------------------------------------------------------------------------- #
+# (7) local_instances — waiting state filter picks up the form-paused run
+# --------------------------------------------------------------------------- #
+p1d_waiting=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" instances --local --state waiting --json)
+[ "$(jq '.total' <<<"$p1d_waiting")" -eq 1 ] \
+  || { echo "FAIL: instances --local --state waiting should total 1, got $(jq '.total' <<<"$p1d_waiting")"; exit 1; }
+[ "$(jq -r '.instances[0].id' <<<"$p1d_waiting")" = "$p1d_c1_id" ] \
+  || { echo "FAIL: instances --local --state waiting should return proc-c's run id"; exit 1; }
+echo "PASS: instances --local --state waiting — picks up the form-paused run"
+
+# --------------------------------------------------------------------------- #
+# (8) local_instances -- unknown flag errors
+# --------------------------------------------------------------------------- #
+set +e
+OPENSOP_LOCAL_HOME="$p1d_home" "$cli" instances --local --bogus-flag --json >/dev/null 2>&1; p1d_bad_rc=$?
+set -e
+[ "$p1d_bad_rc" -ne 0 ] \
+  || { echo "FAIL: instances --local unknown flag should exit non-zero"; exit 1; }
+echo "PASS: instances --local — unknown flag exits non-zero"
+
+# --------------------------------------------------------------------------- #
+# (9) local_compass — three-ranking shape over the 5 runs
+# --------------------------------------------------------------------------- #
+p1d_compass=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" compass --local --json)
+
+jq -e 'has("by_runs") and has("by_recency") and has("by_failure_rate")' <<<"$p1d_compass" >/dev/null \
+  || { echo "FAIL: compass --local missing by_runs, by_recency, or by_failure_rate"; exit 1; }
+echo "PASS: compass --local — JSON shape has by_runs, by_recency, by_failure_rate"
+
+# by_runs: proc-a should have 3 runs (highest count)
+jq -e '.by_runs[0].name == "proc-a" and .by_runs[0].total == 3' <<<"$p1d_compass" >/dev/null \
+  || { echo "FAIL: compass --local by_runs[0] should be proc-a × 3, got: $(jq -c '.by_runs[0]' <<<"$p1d_compass")"; exit 1; }
+echo "PASS: compass --local — by_runs[0] is proc-a × 3 (most runs)"
+
+# by_failure_rate: proc-a has 1/3 failures; proc-b and proc-c have 0 failures
+# proc-a rate should be highest
+jq -e '.by_failure_rate[0].name == "proc-a"' <<<"$p1d_compass" >/dev/null \
+  || { echo "FAIL: compass --local by_failure_rate[0] should be proc-a, got: $(jq -r '.by_failure_rate[0].name' <<<"$p1d_compass")"; exit 1; }
+echo "PASS: compass --local — by_failure_rate[0] is proc-a (highest failure rate)"
+
+# proc-a failure rate should be ~0.333 (1 failed out of 3)
+jq -e '.by_failure_rate[0].failures == 1 and .by_failure_rate[0].total == 3' <<<"$p1d_compass" >/dev/null \
+  || { echo "FAIL: compass --local proc-a failure stats wrong"; exit 1; }
+echo "PASS: compass --local — proc-a has 1 failure out of 3 (correct rate)"
+
+# by_recency: array is populated (at least 3 entries for proc-a, proc-b, proc-c)
+[ "$(jq '.by_recency | length' <<<"$p1d_compass")" -ge 3 ] \
+  || { echo "FAIL: compass --local by_recency should have at least 3 entries"; exit 1; }
+echo "PASS: compass --local — by_recency has at least 3 entries"
+
+# Each by_recency entry has name and last_run_at
+jq -e '.by_recency[0] | has("name") and has("last_run_at")' <<<"$p1d_compass" >/dev/null \
+  || { echo "FAIL: compass --local by_recency[0] missing name or last_run_at"; exit 1; }
+echo "PASS: compass --local — by_recency entries have name and last_run_at"
+
+# --------------------------------------------------------------------------- #
+# (10) local_history --process proc-a: same as instances --process proc-a
+# --------------------------------------------------------------------------- #
+p1d_hist=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" history --local --process proc-a --json)
+
+jq -e 'has("instances") and has("total")' <<<"$p1d_hist" >/dev/null \
+  || { echo "FAIL: history --local missing instances or total"; exit 1; }
+echo "PASS: history --local — JSON shape has instances and total"
+
+[ "$(jq '.total' <<<"$p1d_hist")" -eq 3 ] \
+  || { echo "FAIL: history --local --process proc-a should total 3, got $(jq '.total' <<<"$p1d_hist")"; exit 1; }
+echo "PASS: history --local --process proc-a — total is 3"
+
+jq -e '.instances | all(.process.name == "proc-a")' <<<"$p1d_hist" >/dev/null \
+  || { echo "FAIL: history --local returned non-proc-a entries"; exit 1; }
+echo "PASS: history --local — all entries are proc-a"
+
+# --------------------------------------------------------------------------- #
+# (11) local_history --limit: caps the returned entries
+# --------------------------------------------------------------------------- #
+p1d_hist_lim=$(OPENSOP_LOCAL_HOME="$p1d_home" "$cli" history --local --process proc-a --limit 2 --json)
+[ "$(jq '.instances | length' <<<"$p1d_hist_lim")" -eq 2 ] \
+  || { echo "FAIL: history --local --limit 2 should return 2 entries, got $(jq '.instances | length' <<<"$p1d_hist_lim")"; exit 1; }
+[ "$(jq '.total' <<<"$p1d_hist_lim")" -eq 3 ] \
+  || { echo "FAIL: history --local --limit 2 total should still be 3, got $(jq '.total' <<<"$p1d_hist_lim")"; exit 1; }
+echo "PASS: history --local --limit 2 — returns 2 entries, total still 3"
+
+# --------------------------------------------------------------------------- #
+# (12) local_history failure path: missing --process errors
+# --------------------------------------------------------------------------- #
+set +e
+OPENSOP_LOCAL_HOME="$p1d_home" "$cli" history --local --json >/dev/null 2>&1; p1d_hist_noarg_rc=$?
+set -e
+[ "$p1d_hist_noarg_rc" -ne 0 ] \
+  || { echo "FAIL: history --local without --process should exit non-zero"; exit 1; }
+echo "PASS: history --local — missing --process exits non-zero"
+
+# --------------------------------------------------------------------------- #
+# (13) local_instances empty store: --local when no runs exist returns empty list
+# --------------------------------------------------------------------------- #
+p1d_empty_home="$(mktemp -d)"
+p1d_empty=$( OPENSOP_LOCAL_HOME="$p1d_empty_home" "$cli" instances --local --json )
+[ "$(jq '.total' <<<"$p1d_empty")" -eq 0 ] \
+  || { echo "FAIL: instances --local on empty store should total 0, got $(jq '.total' <<<"$p1d_empty")"; exit 1; }
+[ "$(jq '.instances | length' <<<"$p1d_empty")" -eq 0 ] \
+  || { echo "FAIL: instances --local on empty store should return empty array"; exit 1; }
+rm -rf "$p1d_empty_home"
+echo "PASS: instances --local — empty store returns {instances:[], total:0}"
+
+# compass on empty store: returns the three empty rankings
+p1d_empty_home2="$(mktemp -d)"
+p1d_empty_compass=$( OPENSOP_LOCAL_HOME="$p1d_empty_home2" "$cli" compass --local --json )
+jq -e '.by_runs == [] and .by_recency == [] and .by_failure_rate == []' <<<"$p1d_empty_compass" >/dev/null \
+  || { echo "FAIL: compass --local on empty store should return three empty arrays, got: $p1d_empty_compass"; exit 1; }
+rm -rf "$p1d_empty_home2"
+echo "PASS: compass --local — empty store returns three empty ranking arrays"
+
+# Cleanup p1d dedicated home
+rm -rf "$p1d_home"
+
+# --------------------------------------------------------------------------- #
+# P1e: local_diff — compare two local runs
+#
+# Full coverage:
+#   (1) diff of two identical runs → identical:true, differences:[]
+#   (2) diff of two runs with different inputs → differences shows inputs delta
+#   (3) diff of two runs with different final context/outputs → outputs delta
+#   (4) diff of two completed runs where one step has different state → step delta
+#   (5) unknown run_id → error (instance_not_found)
+#   (6) runs from different processes → error (same-process guard)
+# --------------------------------------------------------------------------- #
+p1e_home="$(mktemp -d)"
+
+# Process A: a simple two-step shell process so inputs and outputs differ.
+p1e_proc_a="$p1e_home/proc-a.sop.json"
+cat > "$p1e_proc_a" <<'JSON'
+{
+  "name": "p1e-proc-a",
+  "inputs": {"name": ""},
+  "steps": [
+    { "id": "greet", "type": "shell",
+      "run": "echo \"hello, $(echo \"$OSL_CONTEXT\" | jq -r '.name')\"" }
+  ]
+}
+JSON
+
+# Process B: different name (for the cross-process guard test).
+p1e_proc_b="$p1e_home/proc-b.sop.json"
+cat > "$p1e_proc_b" <<'JSON'
+{
+  "name": "p1e-proc-b",
+  "inputs": {},
+  "steps": [ { "id": "noop", "type": "noop" } ]
+}
+JSON
+
+# Run A1: name=alice
+p1e_m_a1=$(OPENSOP_LOCAL_HOME="$p1e_home" "$cli" run "$p1e_proc_a" --local --input name=alice --json)
+p1e_rid_a1=$(jq -r '.run_id' <<<"$p1e_m_a1")
+[ "$(jq -r '.status' <<<"$p1e_m_a1")" = "completed" ] || { echo "FAIL: p1e run A1 should complete"; exit 1; }
+
+# Run A2: name=bob (different input → different output context)
+p1e_m_a2=$(OPENSOP_LOCAL_HOME="$p1e_home" "$cli" run "$p1e_proc_a" --local --input name=bob --json)
+p1e_rid_a2=$(jq -r '.run_id' <<<"$p1e_m_a2")
+[ "$(jq -r '.status' <<<"$p1e_m_a2")" = "completed" ] || { echo "FAIL: p1e run A2 should complete"; exit 1; }
+
+# Run A3: same args as A1 (name=alice) — used for the identical-runs test.
+p1e_m_a3=$(OPENSOP_LOCAL_HOME="$p1e_home" "$cli" run "$p1e_proc_a" --local --input name=alice --json)
+p1e_rid_a3=$(jq -r '.run_id' <<<"$p1e_m_a3")
+
+# (1) Identical inputs + same process → should be identical (both completed, same step outputs)
+p1e_diff_same=$(OPENSOP_LOCAL_HOME="$p1e_home" "$cli" diff "$p1e_rid_a1" "$p1e_rid_a3" --local --json)
+[ "$(jq -r '.identical' <<<"$p1e_diff_same")" = "true" ] \
+  || { echo "FAIL: p1e diff of identical runs should be identical:true, got: $(jq -r '.identical' <<<"$p1e_diff_same")"; exit 1; }
+[ "$(jq '.differences | length' <<<"$p1e_diff_same")" -eq 0 ] \
+  || { echo "FAIL: p1e diff of identical runs should have 0 differences, got: $(jq '.differences | length' <<<"$p1e_diff_same")"; exit 1; }
+echo "PASS: diff --local — identical runs produce identical:true, differences:[]"
+
+# (2) JSON shape check: a and b blocks have correct run IDs and state.
+[ "$(jq -r '.a.id' <<<"$p1e_diff_same")" = "$p1e_rid_a1" ] \
+  || { echo "FAIL: p1e diff a.id should be rid_a1"; exit 1; }
+[ "$(jq -r '.b.id' <<<"$p1e_diff_same")" = "$p1e_rid_a3" ] \
+  || { echo "FAIL: p1e diff b.id should be rid_a3"; exit 1; }
+[ "$(jq -r '.a.state' <<<"$p1e_diff_same")" = "completed" ] \
+  || { echo "FAIL: p1e diff a.state should be 'completed'"; exit 1; }
+echo "PASS: diff --local — JSON shape has a.id, b.id, a.state correctly set"
+
+# (3) Different inputs (which produce different shell outputs) → runs are not identical.
+# Note: inputs is NOT diffed (matches remote cmd_diff which also omits inputs).
+# The difference is captured in the 'outputs' path (final context differs because inputs differ).
+p1e_diff_ab=$(OPENSOP_LOCAL_HOME="$p1e_home" "$cli" diff "$p1e_rid_a1" "$p1e_rid_a2" --local --json)
+[ "$(jq -r '.identical' <<<"$p1e_diff_ab")" = "false" ] \
+  || { echo "FAIL: p1e diff of different-input runs should be identical:false"; exit 1; }
+echo "PASS: diff --local — different-input runs produce identical:false"
+[ "$(jq '.differences | length' <<<"$p1e_diff_ab")" -gt 0 ] \
+  || { echo "FAIL: p1e diff should have at least one difference when runs differ"; exit 1; }
+echo "PASS: diff --local — non-empty differences when runs differ (inputs not diffed; outputs captures delta)"
+
+# (4) Different outputs → differences includes "outputs" path.
+# (inputs are not diffed — parity with remote cmd_diff; outputs captures the observable delta)
+jq -e '.differences | map(.path) | contains(["outputs"])' <<<"$p1e_diff_ab" >/dev/null \
+  || { echo "FAIL: p1e diff should report 'outputs' delta when final contexts differ"; exit 1; }
+echo "PASS: diff --local — different contexts produce differences containing 'outputs' path"
+
+# (5) Run B: different process (for cross-process guard).
+p1e_m_b=$(OPENSOP_LOCAL_HOME="$p1e_home" "$cli" run "$p1e_proc_b" --local --json)
+p1e_rid_b=$(jq -r '.run_id' <<<"$p1e_m_b")
+set +e
+OPENSOP_LOCAL_HOME="$p1e_home" "$cli" diff "$p1e_rid_a1" "$p1e_rid_b" --local --json >/dev/null 2>&1
+p1e_xproc_rc=$?
+set -e
+[ "$p1e_xproc_rc" -ne 0 ] \
+  || { echo "FAIL: diff --local of runs from different processes should exit non-zero"; exit 1; }
+echo "PASS: diff --local — cross-process diff is rejected (same-process guard)"
+
+# (6) Unknown run_id → error.
+set +e
+OPENSOP_LOCAL_HOME="$p1e_home" "$cli" diff "no-such-run" "$p1e_rid_a1" --local --json >/dev/null 2>&1
+p1e_norun_rc=$?
+set -e
+[ "$p1e_norun_rc" -ne 0 ] \
+  || { echo "FAIL: diff --local with unknown run_id should exit non-zero"; exit 1; }
+echo "PASS: diff --local — unknown run_id exits non-zero (instance_not_found)"
+
+# (7) Unknown second run_id → error.
+set +e
+OPENSOP_LOCAL_HOME="$p1e_home" "$cli" diff "$p1e_rid_a1" "no-such-run-2" --local --json >/dev/null 2>&1
+p1e_norun2_rc=$?
+set -e
+[ "$p1e_norun2_rc" -ne 0 ] \
+  || { echo "FAIL: diff --local with unknown second run_id should exit non-zero"; exit 1; }
+echo "PASS: diff --local — unknown second run_id exits non-zero"
+
+# (8) Missing args → error.
+set +e
+OPENSOP_LOCAL_HOME="$p1e_home" "$cli" diff "$p1e_rid_a1" --local --json >/dev/null 2>&1
+p1e_missing_rc=$?
+set -e
+[ "$p1e_missing_rc" -ne 0 ] \
+  || { echo "FAIL: diff --local with only one run_id should exit non-zero"; exit 1; }
+echo "PASS: diff --local — missing second run_id exits non-zero (usage_error)"
+
+# (9) confidence in diff: two runs of the same approval process submitted with
+#     different confidence values → steps.<sid>.confidence appears in differences.
+p1e_conf_proc="$p1e_home/conf-proc.sop.json"
+cat > "$p1e_conf_proc" <<'JSON'
+{
+  "name": "p1e-conf",
+  "inputs": {},
+  "steps": [
+    { "id": "gate", "type": "approval" }
+  ]
+}
+JSON
+# Run 1: pause at approval
+set +e
+p1e_conf_m1=$(OPENSOP_LOCAL_HOME="$p1e_home" "$cli" run "$p1e_conf_proc" --local --json); p1e_conf_rc1=$?
+set -e
+p1e_conf_rid1=$(jq -r '.run_id' <<<"$p1e_conf_m1")
+# Submit with confidence=0.9
+OPENSOP_LOCAL_HOME="$p1e_home" "$cli" submit "$p1e_conf_rid1" gate --local \
+  --output decision=approve --confidence 0.9 --json >/dev/null
+
+# Run 2: pause at approval
+set +e
+p1e_conf_m2=$(OPENSOP_LOCAL_HOME="$p1e_home" "$cli" run "$p1e_conf_proc" --local --json); p1e_conf_rc2=$?
+set -e
+p1e_conf_rid2=$(jq -r '.run_id' <<<"$p1e_conf_m2")
+# Submit with confidence=0.5 (different)
+OPENSOP_LOCAL_HOME="$p1e_home" "$cli" submit "$p1e_conf_rid2" gate --local \
+  --output decision=approve --confidence 0.5 --json >/dev/null
+
+p1e_conf_diff=$(OPENSOP_LOCAL_HOME="$p1e_home" "$cli" diff "$p1e_conf_rid1" "$p1e_conf_rid2" --local --json)
+jq -e '.differences | map(.path) | contains(["steps.gate.confidence"])' <<<"$p1e_conf_diff" >/dev/null \
+  || { echo "FAIL: diff --local should include steps.gate.confidence when confidence differs"; exit 1; }
+echo "PASS: diff --local — steps.<sid>.confidence is diffed when approval submissions have different confidence"
+
+# Cleanup p1e home.
+rm -rf "$p1e_home"
+
+# --------------------------------------------------------------------------- #
+# P1f: local_cancel <run_id> [--reason TEXT]
+#
+# Full coverage:
+#   (1) Cancel a waiting run → status="cancelled", receipt present, ended_at set
+#   (2) reason is recorded in the audit receipt when supplied
+#   (3) waiting block and cursor are cleared on cancel
+#   (4) Cancel a completed run → rejected (invalid transition)
+#   (5) Cancel a failed run → rejected
+#   (6) Cancel an already-cancelled run → rejected
+#   (7) Unknown run_id → error (instance_not_found)
+#   (8) Missing run_id → usage_error
+# --------------------------------------------------------------------------- #
+p1f_home="$(mktemp -d)"
+
+# Process with a form step (gives us a waiting run to cancel)
+p1f_proc="$p1f_home/p1f.sop.json"
+cat > "$p1f_proc" <<'JSON'
+{
+  "name": "p1f-test",
+  "inputs": {},
+  "steps": [
+    { "id": "build", "type": "shell", "run": "echo built" },
+    { "id": "gate",  "type": "form",
+      "inputs": [{ "name": "val", "type": "string", "required": true }] },
+    { "id": "after", "type": "shell", "run": "echo should-not-run" }
+  ]
+}
+JSON
+
+# A completed process (for the invalid-transition test)
+p1f_proc_complete="$p1f_home/p1f-complete.sop.json"
+cat > "$p1f_proc_complete" <<'JSON'
+{ "name": "p1f-complete", "inputs": {},
+  "steps": [ { "id": "s", "type": "shell", "run": "echo done" } ] }
+JSON
+
+# A failing process (for the invalid-transition test)
+p1f_proc_fail="$p1f_home/p1f-fail.sop.json"
+cat > "$p1f_proc_fail" <<'JSON'
+{ "name": "p1f-fail", "inputs": {},
+  "steps": [ { "id": "s", "type": "shell", "run": "exit 1" } ] }
+JSON
+
+# Setup: create a waiting run
+set +e
+p1f_wait_m="$(OPENSOP_LOCAL_HOME="$p1f_home" "$cli" run "$p1f_proc" --local --json)"; p1f_wait_rc=$?
+set -e
+[ "$p1f_wait_rc" -eq 0 ] || { echo "FAIL: p1f waiting run should exit 0"; exit 1; }
+p1f_wait_id="$(jq -r '.run_id' <<<"$p1f_wait_m")"
+[ "$(jq -r '.status' <<<"$p1f_wait_m")" = "waiting" ] \
+  || { echo "FAIL: p1f run should be 'waiting', got $(jq -r '.status' <<<"$p1f_wait_m")"; exit 1; }
+echo "PASS: p1f setup — waiting run created"
+
+# (1) Cancel a waiting run → exits 0, JSON envelope has state="cancelled"
+# The JSON output is a normalized InstanceSerializer-shaped envelope (id, process, state, ...)
+# matching what the runtime's cancel controller returns — not the raw manifest.
+p1f_cancel_out="$(OPENSOP_LOCAL_HOME="$p1f_home" "$cli" cancel "$p1f_wait_id" --local \
+  --reason "test cancellation" --json)"
+[ "$(jq -r '.state' <<<"$p1f_cancel_out")" = "cancelled" ] \
+  || { echo "FAIL: p1f cancel waiting run should have state=cancelled in JSON envelope, got $(jq -r '.state' <<<"$p1f_cancel_out")"; exit 1; }
+echo "PASS: cancel --local — waiting run cancelled (state=cancelled in InstanceSerializer envelope)"
+
+# Verify the envelope shape matches InstanceSerializer (id, process.name, state, completed_at)
+jq -e 'has("id") and has("process") and has("state") and has("completed_at")' <<<"$p1f_cancel_out" >/dev/null \
+  || { echo "FAIL: cancel --local JSON envelope missing required keys (id/process/state/completed_at)"; exit 1; }
+echo "PASS: cancel --local — JSON envelope has id, process, state, completed_at (InstanceSerializer shape)"
+
+[ "$(jq -r '.id' <<<"$p1f_cancel_out")" = "$p1f_wait_id" ] \
+  || { echo "FAIL: cancel --local JSON envelope .id should be the run_id"; exit 1; }
+echo "PASS: cancel --local — JSON envelope .id matches the run_id"
+
+[ "$(jq -r '.process.name' <<<"$p1f_cancel_out")" = "p1f-test" ] \
+  || { echo "FAIL: cancel --local JSON envelope .process.name should be 'p1f-test'"; exit 1; }
+echo "PASS: cancel --local — JSON envelope .process.name is correct"
+
+# (2) ended_at is set in the manifest
+p1f_manifest_on_disk="$(cat "$p1f_home/runs/$p1f_wait_id/manifest.json")"
+[ "$(jq -r '.ended_at // ""' <<<"$p1f_manifest_on_disk")" != "" ] \
+  || { echo "FAIL: p1f cancel should write ended_at, got empty"; exit 1; }
+echo "PASS: cancel --local — ended_at is set after cancel"
+
+# (3) waiting and cursor blocks are cleared
+jq -e '.waiting == null or (has("waiting") | not)' <<<"$p1f_manifest_on_disk" >/dev/null \
+  || { echo "FAIL: p1f cancel should clear waiting block, got: $(jq -c '.waiting' <<<"$p1f_manifest_on_disk")"; exit 1; }
+echo "PASS: cancel --local — waiting block cleared after cancel"
+
+# (4) audit.jsonl has a cancelled receipt with reason
+p1f_audit="$p1f_home/runs/$p1f_wait_id/audit.jsonl"
+jq -e 'select(.status=="cancelled" and .type=="cancel")' "$p1f_audit" >/dev/null \
+  || { echo "FAIL: p1f cancel audit receipt missing (type=cancel, status=cancelled)"; exit 1; }
+echo "PASS: cancel --local — audit receipt present with type=cancel, status=cancelled"
+
+jq -e 'select(.status=="cancelled" and .reason=="test cancellation")' "$p1f_audit" >/dev/null \
+  || { echo "FAIL: p1f cancel audit receipt should include reason='test cancellation'"; exit 1; }
+echo "PASS: cancel --local — reason is recorded in audit receipt"
+
+# (5) status --local shows the run as cancelled with ended_at
+p1f_status_out="$(OPENSOP_LOCAL_HOME="$p1f_home" "$cli" status "$p1f_wait_id" --local --json)"
+[ "$(jq -r '.state' <<<"$p1f_status_out")" = "cancelled" ] \
+  || { echo "FAIL: status --local of cancelled run should show state=cancelled, got $(jq -r '.state' <<<"$p1f_status_out")"; exit 1; }
+echo "PASS: cancel --local — status shows state=cancelled"
+
+[ "$(jq -r '.completed_at // ""' <<<"$p1f_status_out")" != "" ] \
+  || { echo "FAIL: status --local of cancelled run should have non-null completed_at"; exit 1; }
+echo "PASS: cancel --local — status shows non-null completed_at"
+
+# (6) Failure path: cancel a completed run → rejected
+p1f_complete_m="$(OPENSOP_LOCAL_HOME="$p1f_home" "$cli" run "$p1f_proc_complete" --local --json)"
+p1f_complete_id="$(jq -r '.run_id' <<<"$p1f_complete_m")"
+[ "$(jq -r '.status' <<<"$p1f_complete_m")" = "completed" ] \
+  || { echo "FAIL: p1f complete run setup failed"; exit 1; }
+
+set +e
+OPENSOP_LOCAL_HOME="$p1f_home" "$cli" cancel "$p1f_complete_id" --local --json >/dev/null 2>&1
+p1f_compl_rc=$?
+set -e
+[ "$p1f_compl_rc" -ne 0 ] \
+  || { echo "FAIL: cancel --local of completed run should exit non-zero"; exit 1; }
+echo "PASS: cancel --local — completed run is rejected (invalid transition)"
+
+# (7) Failure path: cancel a failed run → rejected
+set +e
+p1f_fail_m="$(OPENSOP_LOCAL_HOME="$p1f_home" "$cli" run "$p1f_proc_fail" --local --json)"; p1f_fail_setup_rc=$?
+set -e
+p1f_fail_id="$(jq -r '.run_id' <<<"$p1f_fail_m")"
+[ "$(jq -r '.status' <<<"$p1f_fail_m")" = "failed" ] \
+  || { echo "FAIL: p1f fail run setup failed, got $(jq -r '.status' <<<"$p1f_fail_m")"; exit 1; }
+
+set +e
+OPENSOP_LOCAL_HOME="$p1f_home" "$cli" cancel "$p1f_fail_id" --local --json >/dev/null 2>&1
+p1f_fail_rc=$?
+set -e
+[ "$p1f_fail_rc" -ne 0 ] \
+  || { echo "FAIL: cancel --local of failed run should exit non-zero"; exit 1; }
+echo "PASS: cancel --local — failed run is rejected (invalid transition)"
+
+# (8) Failure path: cancel an already-cancelled run → rejected
+set +e
+OPENSOP_LOCAL_HOME="$p1f_home" "$cli" cancel "$p1f_wait_id" --local --json >/dev/null 2>&1
+p1f_dup_rc=$?
+set -e
+[ "$p1f_dup_rc" -ne 0 ] \
+  || { echo "FAIL: cancel --local of already-cancelled run should exit non-zero"; exit 1; }
+echo "PASS: cancel --local — already-cancelled run is rejected (invalid transition)"
+
+# (9) Failure path: unknown run_id → instance_not_found
+set +e
+p1f_norun_err="$(OPENSOP_LOCAL_HOME="$p1f_home" "$cli" cancel "no-such-run-xyz" --local --json 2>&1)"; p1f_norun_rc=$?
+set -e
+[ "$p1f_norun_rc" -ne 0 ] \
+  || { echo "FAIL: cancel --local with unknown run_id should exit non-zero"; exit 1; }
+echo "$p1f_norun_err" | jq -e '.error == "instance_not_found"' >/dev/null \
+  || { echo "FAIL: cancel --local unknown run_id should emit instance_not_found, got: $p1f_norun_err"; exit 1; }
+echo "PASS: cancel --local — unknown run_id exits non-zero with instance_not_found"
+
+# (10) Failure path: missing run_id → usage_error
+set +e
+OPENSOP_LOCAL_HOME="$p1f_home" "$cli" cancel --local --json >/dev/null 2>&1
+p1f_noarg_rc=$?
+set -e
+[ "$p1f_noarg_rc" -ne 0 ] \
+  || { echo "FAIL: cancel --local with no args should exit non-zero"; exit 1; }
+echo "PASS: cancel --local — missing run_id exits non-zero (usage_error)"
+
+# Cleanup p1f home.
+rm -rf "$p1f_home"
+
+# --------------------------------------------------------------------------- #
+# U2a: FLIP THE DEFAULT TO LOCAL — Phase 2 routing assertions (v0.8.0)
+#
+# The default backend is now LOCAL; --remote / --server opt into remote.
+# These tests exercise the NEW default behavior (no flag) to ensure the flip
+# actually works — not just that --local is accepted as a no-op.
+# --------------------------------------------------------------------------- #
+
+u2a_home="$(mktemp -d)"
+trap 'rm -rf "$u2a_home"' EXIT
+
+# Create a minimal local process for testing.
+u2a_proc="$u2a_home/hello.sop.json"
+cat > "$u2a_proc" <<'JSON'
+{ "name": "u2a-hello", "inputs": {},
+  "steps": [ { "id": "greet", "type": "shell", "run": "echo hello-u2a" } ] }
+JSON
+
+# --- (1) 'run' with NO flag creates a local run (not a remote call) ---
+set +e
+u2a_run_out="$(OPENSOP_LOCAL_HOME="$u2a_home" "$cli" run "$u2a_proc" --json)"; u2a_run_rc=$?
+set -e
+[ "$u2a_run_rc" -eq 0 ] || { echo "FAIL: U2a run no-flag should exit 0 (local default), got $u2a_run_rc"; exit 1; }
+[ "$(jq -r '.status' <<<"$u2a_run_out")" = "completed" ] \
+  || { echo "FAIL: U2a run no-flag should complete locally, got $(jq -r '.status' <<<"$u2a_run_out")"; exit 1; }
+u2a_run_id="$(jq -r '.run_id' <<<"$u2a_run_out")"
+[ -d "$u2a_home/runs/$u2a_run_id" ] \
+  || { echo "FAIL: U2a run no-flag should create a receipt under OPENSOP_LOCAL_HOME/runs/"; exit 1; }
+echo "PASS: U2a run — no flag routes to LOCAL backend (receipt created in OPENSOP_LOCAL_HOME)"
+
+# --- (2) 'list' with NO flag shows local processes (no server) ---
+set +e
+u2a_list_out="$(OPENSOP_LOCAL_HOME="$u2a_home" "$cli" list --json 2>/dev/null)"; u2a_list_rc=$?
+set -e
+# Local list returns an array of process entries, not an HTTP error.
+# Even with no processes found in a cell/cwd-fallback, it should not fail.
+# Specifically it should NOT try to hit a server and fail with a network error.
+[ "$u2a_list_rc" -eq 0 ] || { echo "FAIL: U2a list no-flag should exit 0 (local default), got $u2a_list_rc"; exit 1; }
+echo "PASS: U2a list — no flag routes to LOCAL backend (exits 0, no server contact)"
+
+# --- (3) 'status' with NO flag reads a local run's manifest ---
+set +e
+u2a_status_out="$(OPENSOP_LOCAL_HOME="$u2a_home" "$cli" status "$u2a_run_id" --json)"; u2a_status_rc=$?
+set -e
+[ "$u2a_status_rc" -eq 0 ] || { echo "FAIL: U2a status no-flag should exit 0 (local default), got $u2a_status_rc"; exit 1; }
+[ "$(jq -r '.state' <<<"$u2a_status_out")" = "completed" ] \
+  || { echo "FAIL: U2a status no-flag should return local run state, got $(jq -r '.state' <<<"$u2a_status_out")"; exit 1; }
+[ "$(jq -r '.id' <<<"$u2a_status_out")" = "$u2a_run_id" ] \
+  || { echo "FAIL: U2a status no-flag .id should be the run_id"; exit 1; }
+echo "PASS: U2a status — no flag routes to LOCAL backend (reads local manifest)"
+
+# --- (4) 'instances' with NO flag lists local runs ---
+set +e
+u2a_inst_out="$(OPENSOP_LOCAL_HOME="$u2a_home" "$cli" instances --json)"; u2a_inst_rc=$?
+set -e
+[ "$u2a_inst_rc" -eq 0 ] || { echo "FAIL: U2a instances no-flag should exit 0 (local default), got $u2a_inst_rc"; exit 1; }
+[ "$(jq -r '.total' <<<"$u2a_inst_out")" = "1" ] \
+  || { echo "FAIL: U2a instances no-flag should show 1 local run, got $(jq -r '.total' <<<"$u2a_inst_out")"; exit 1; }
+echo "PASS: U2a instances — no flag routes to LOCAL backend (shows the local run)"
+
+# --- (5) 'search' with NO flag searches local process files ---
+set +e
+u2a_search_out="$(OPENSOP_LOCAL_HOME="$u2a_home" "$cli" search hello --json 2>/dev/null)"; u2a_search_rc=$?
+set -e
+# Local search with no cell produces no results (no processes/ dir), but should NOT error.
+[ "$u2a_search_rc" -eq 0 ] || { echo "FAIL: U2a search no-flag should exit 0 (local default), got $u2a_search_rc"; exit 1; }
+echo "PASS: U2a search — no flag routes to LOCAL backend (exits 0, no server contact)"
+
+# --- (6) '--local' (deprecated no-op) yields the same local result as no flag ---
+set +e
+u2a_local_flag_out="$(OPENSOP_LOCAL_HOME="$u2a_home" "$cli" status "$u2a_run_id" --local --json)"; u2a_local_flag_rc=$?
+set -e
+[ "$u2a_local_flag_rc" -eq 0 ] || { echo "FAIL: U2a status --local should exit 0 (same as no-flag), got $u2a_local_flag_rc"; exit 1; }
+[ "$(jq -r '.state' <<<"$u2a_local_flag_out")" = "completed" ] \
+  || { echo "FAIL: U2a status --local should return the same local result as no-flag"; exit 1; }
+echo "PASS: U2a --local (deprecated) — accepted without error, yields same local result as no-flag"
+
+# --- (7) '--server http://127.0.0.1:1' (unreachable) routes to REMOTE, not local ---
+# The run_id above is a valid local run, so if the flip were broken, --server
+# would fall through to the local path and succeed. Instead, with --server it
+# must attempt the remote path and fail (connection refused or no curl).
+set +e
+"$cli" --server http://127.0.0.1:1 status "$u2a_run_id" --json >/dev/null 2>&1
+u2a_server_rc=$?
+set -e
+# Expected: non-zero (network_error: connection refused to 127.0.0.1:1).
+[ "$u2a_server_rc" -ne 0 ] \
+  || { echo "FAIL: U2a --server <url> should attempt remote (not local); status on closed port must fail"; exit 1; }
+echo "PASS: U2a --server <url> — routes to REMOTE (fails with network error, not local result)"
+
+# --- (8) '--remote' with no configured URL → config_missing error ---
+set +e
+u2a_remote_nourl_err="$(OPENSOP_URL="" OPENSOP_HOME="$u2a_home" "$cli" --remote list --json 2>&1)"; u2a_remote_nourl_rc=$?
+set -e
+[ "$u2a_remote_nourl_rc" -ne 0 ] \
+  || { echo "FAIL: U2a --remote with no OPENSOP_URL should exit non-zero"; exit 1; }
+echo "$u2a_remote_nourl_err" | jq -e '.error == "config_missing"' >/dev/null \
+  || { echo "FAIL: U2a --remote with no URL should emit config_missing error, got: $u2a_remote_nourl_err"; exit 1; }
+echo "PASS: U2a --remote with no URL — exits non-zero with config_missing error"
+
+# --- (9) 'register' with no --remote/--server → usage_error directing to --remote ---
+set +e
+u2a_reg_out="$("$cli" register /dev/null --json 2>&1)"; u2a_reg_rc=$?
+set -e
+[ "$u2a_reg_rc" -ne 0 ] \
+  || { echo "FAIL: U2a register with no --remote should exit non-zero"; exit 1; }
+echo "$u2a_reg_out" | jq -e '.error == "usage_error"' >/dev/null \
+  || { echo "FAIL: U2a register with no --remote should emit usage_error, got: $u2a_reg_out"; exit 1; }
+echo "$u2a_reg_out" | jq -r '.hint' | grep -q "\-\-remote\|\-\-server" \
+  || { echo "FAIL: U2a register usage_error hint should mention --remote or --server, got: $(echo "$u2a_reg_out" | jq -r '.hint')"; exit 1; }
+echo "PASS: U2a register no --remote — exits non-zero with usage_error, hint mentions --remote/--server"
+
+# --- (10) 'register --server http://127.0.0.1:1' → attempts remote (fails with network error) ---
+set +e
+"$cli" --server http://127.0.0.1:1 register "$u2a_proc" --json >/dev/null 2>&1
+u2a_reg_server_rc=$?
+set -e
+[ "$u2a_reg_server_rc" -ne 0 ] \
+  || { echo "FAIL: U2a register --server <url> should fail (no server at 127.0.0.1:1), got exit 0"; exit 1; }
+echo "PASS: U2a register --server <url> — attempts remote (fails with network error, not usage_error)"
+
+# --- (11) 'run' with NO flag, explicitly NO --local — the file path form ---
+# Exercise that the default-local path works when --local is ABSENT entirely.
+set +e
+u2a_run2_out="$(OPENSOP_LOCAL_HOME="$u2a_home" "$cli" run "$u2a_proc" --json)"; u2a_run2_rc=$?
+set -e
+[ "$u2a_run2_rc" -eq 0 ] || { echo "FAIL: U2a run (no --local flag, file path) should exit 0, got $u2a_run2_rc"; exit 1; }
+[ "$(jq -r '.status' <<<"$u2a_run2_out")" = "completed" ] \
+  || { echo "FAIL: U2a run (no --local flag, file path) should complete locally, got $(jq -r '.status' <<<"$u2a_run2_out")"; exit 1; }
+echo "PASS: U2a run — no --local flag (truly absent) still routes to LOCAL backend"
+
+# Cleanup u2a home.
+rm -rf "$u2a_home"
+trap - EXIT
+
+# --------------------------------------------------------------------------- #
+# schema <name> without --remote — must exit non-zero with usage_error
+# (schema fetch is remote-only; schema validate is always-local and unaffected)
+# --------------------------------------------------------------------------- #
+set +e
+schema_noremote_out="$("$cli" schema someproc --json 2>&1)"; schema_noremote_rc=$?
+set -e
+[ "$schema_noremote_rc" -ne 0 ] \
+  || { echo "FAIL: schema <name> with no --remote should exit non-zero, got exit 0"; exit 1; }
+echo "$schema_noremote_out" | jq -e '.error == "usage_error"' >/dev/null \
+  || { echo "FAIL: schema <name> with no --remote should emit usage_error, got: $schema_noremote_out"; exit 1; }
+echo "$schema_noremote_out" | jq -r '.hint' | grep -q "\-\-remote\|\-\-server" \
+  || { echo "FAIL: schema usage_error hint should mention --remote or --server, got: $(echo "$schema_noremote_out" | jq -r '.hint')"; exit 1; }
+echo "PASS: schema <name> no --remote — exits non-zero with usage_error, hint mentions --remote/--server"
+
 echo "ALL PASS"
